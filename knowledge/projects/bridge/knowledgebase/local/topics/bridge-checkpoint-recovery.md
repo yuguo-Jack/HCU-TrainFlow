@@ -9,8 +9,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: fixed source delta and actual consumer review; historical pins retained; no HCU runtime validation
 sources:
 - source: nvidia-nemo-megatron-bridge
   path: docs/training/checkpointing.md
@@ -64,7 +64,31 @@ sources:
   path: src/megatron/bridge/training/utils/optimizer_utils.py
   commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 49210014dbe1df236cfa7b80c368222db033601f209ba0c75a2cf88fa4825da3
-retrieved_on: '2026-11-04'
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/training/checkpointing.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: f51281dda5cccba00e8431fa0e27377988045cb7d07a1257e2feb66bdebb86fe
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/training/config.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: fca097a18062d74b23785fe30782d507df32bb1e89816112e377cb70b284a261
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/training/pretrain.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: 6534422c772f10bb8927f3c13e981d40a7758c1d63b458cc5b8372cfa1190c3c
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/training/train.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: a438b252612cbe51cced1193f917333dc08cdae445f3c9497517d34ca7781638
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/models/hf_pretrained/state.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: 1f52430a39ee3716d4be960f5be93814c83c5618931e27d280069670b03e352b
+- source: nvidia-nemo-megatron-bridge
+  path: docs/training/resiliency.md
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: 4766c58a941c5027553435d02559f1a0273f9402c216a5e693a037c4723e2567
+retrieved_on: '2026-11-18'
 ---
 
 # Bridge：完整恢复、数据位置与容错所有权
@@ -93,6 +117,14 @@ DPO loader 的 consumed_samples、GBS/MBS 用行数表示，在 loader 内除二
 
 async_save要求torch_dist等受支持format，Megatron FSDP使用自己的fsdp_dtensor格式，不等同TorchFSDP2。fully_parallel save/load、optimizer reshardable、nonpersistent/local保存是不同选项。async减少暴露写盘但需要真实completion/持久化、host容量与带宽，checkpoint key strictness也可能宽松；成功返回不等于完全相同参数集合。
 
+## 当前恢复覆盖与失败退出
+
+固定 `11d8b349` 在 optimizer load **之前**保存各 param group 的 `max_lr/min_lr/default_config`。仅在正常加载 optimizer 且 `override_opt_param_scheduler=True` 时恢复当前配置的边界：默认组用基础 LR，decoupled 组用独立 LR，有 override 的组回到构建时边界，再以 consumed samples 定位 scheduler。若加载后 `default_config` 序列不同，会告警并退回基础边界；这项序列检查不等于完整参数组身份核对。LoRA+/LSQ 等自定义学习率恢复应比较每组实际 LR、scheduler step 和 optimizer state，不能只看一个全局 LR。
+
+`CheckpointConfig` 同时要求 async_save 有 save 路径、persistent checkpoint worker，以及受支持的 `torch_dist/fsdp_dtensor` 格式。异步 worker 的完成/持久化和数据位置仍须验收。HF 导出全 source keys 被忽略时，新的 StateSource 分支先排空所有 rank 的 generator，汇总 unexpected keys 后统一严格失败或返回空集合；空集合不是完整模型导出成功。精确忽略 key 及量化布局见 [Provider 专题](bridge-provider-conversion.md)。
+
+退出链新增 `_release_cuda_graph_references`，递归清除 chained/LayerWise optimizer 的 `_cudagraphed_grad_copy` 以及全迭代/optimizer graph 全局引用。正常训练和失败/NVRx teardown 前都调用；**失败路径不做 CUDA synchronize**，避免等已失败 peer。正常 local runner 清理仍有同步，二者责任不同。释放引用和删除 checkpoint load 临时结果只减少保活/残留风险，不构成保存完成、故障恢复或多 rank 干净退出的运行证据。
+
 ## 容错接入与恢复owner
 
 NVRX fault tolerance 要求其 ft_launcher/Slurm 及依赖，普通 torchrun 不自动获得功能。当前官方 resiliency 文档明确：inprocess restart 在 NVRx v0.6.0 弃用，上游 main 于 v0.7.0 后移除，v0.6.0/v0.7.0 release 仍含弃用 API；新部署指向 ft_launcher 的 in-job restart。不能假设装最新 NVRx 就有 `nvidia_resiliency_ext.inprocess`。Bridge 的受限入口仍拒绝用户预先初始化 process group 的组合；straggler 检测、local checkpoint、进程重启分属不同职责。官方 NCCL/CUDA 版本和设备要求不能当作 HCU 已验证。
@@ -108,6 +140,15 @@ NVRX fault tolerance 要求其 ft_launcher/Slurm 及依赖，普通 torchrun 不
 2026-11-04 的固定提交 `41af2dcf0dfd83c8933f588bb871b7f56dbd4368` 有三处新边界。MFSDP V2 校验已允许 native `save/load` 配合 `fsdp_dtensor`，但仍拒绝 pretrained_checkpoint 初始化入口、TP/PP>1、多 model chunk、loss scale、CPU offload、LayerWise、per-token loss 和 FP4；去掉旧 BF16/FP8 的硬拒绝不能证明所有 dtype/状态组合已通过。`pretrain` 正常完成后先删除 setup_output 与 train/valid/test iterators，再销毁进程组，减少 DataLoader worker 持有资源；这不是 checkpoint completion。HF 导出仍清理本次未重写的旧权重，新量化路径还写入/清理 quantizer sidecars；权重、量化 recipe/状态、config/tokenizer 要作为同一导出身份核对。checkpoint / DPO / Energon 的所引未变原件支持保留原恢复口径，新增分支仍需真实 save→load 与故障验证。
 
 补采实际 checkpoint 消费者确认：LayerWise 的普通 torch 格式另存 rank-local optimizer state，torch_dist / fsdp_dtensor 由 sharded_state_dict 纳入，不能重复或漏写另一份。`_uses_distributed_optimizer` 同时检查规范化配置与构造后的 optimizer 链；仅看旧 bool 会错判。fsdp_dtensor load 的 strict_fsdp_dtensor_load 缺省可允许 partial load；可用的 Core 模型校验 helper 在非 finetune 时补查缺失项，旧 Core 导入不到 helper 时会跳过，故“load完成”仍不能替代实际模型 key/状态完整性检查。
+
+## 2026-11-18 固定消费者
+
+- [src/megatron/bridge/training/checkpointing.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/training/checkpointing.py)
+- [src/megatron/bridge/training/config.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/training/config.py)
+- [src/megatron/bridge/training/pretrain.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/training/pretrain.py)
+- [src/megatron/bridge/training/train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/training/train.py)
+- [src/megatron/bridge/models/hf_pretrained/state.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/models/hf_pretrained/state.py)
+- [docs/training/resiliency.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/docs/training/resiliency.md)
 
 ## 固定证据与复核范围
 

@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: 7f016e59a5559c23d763e6c3ad0748e1c29d853ee78a3ef707e6c26a10181885
+generated_body_sha256: a17b0f72767ecbd5227b445e65ea25fe9bbecc23792d2f122560a88a7ed90a40
 ---
 
 # hyperloom
@@ -20,7 +20,7 @@ generated_body_sha256: 7f016e59a5559c23d763e6c3ad0748e1c29d853ee78a3ef707e6c26a1
 
 ## 上游资料
 
-- [yuguo-jack-hyperloom](https://github.com/yuguo-Jack/Hyperloom)
+- [yuguo-jack-hyperloom](https://github.com/AMD-AGI/Hyperloom)
 - [选定官方文档原文](knowledgebase/upstream/docs/)
 - [固定源码阅读入口](knowledgebase/upstream/source-map/)
 

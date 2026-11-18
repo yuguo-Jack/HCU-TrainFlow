@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
@@ -84,6 +84,30 @@ sources:
   path: python/cudnn/_pygraph.py
   commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 99738780798d18ea38c5870b4a60ab5aa180638e0ef4d875d4920708819e5f5c
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/block_sparse_attention/api.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: bc46e44f198246362adbd6a83b5dd514d87d3ff9aaa2a8e1cb7f3de7667200d3
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/deepseek_sparse_attention/indexer_backward/api.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: ca9594a32e194180933548bf14eb917c58fea3d7231893fd1cc7602cc3c6a9c8
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 44a84b79c1188e19a2eb7422bdcbe85a9b64b06443ffbe876dba4c116800cb05
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: e13e11fcc72915265264e86da9e1363ef2d2290707b70eb1dcfbec08c3ef247b
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/gemm/frost/graph_analyzer.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: fd02f3c6c1c384491be9ac592f9fe4b6d1508bbf18b4699d2de947d7faaad0c9
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/gemm/cutedsl/grouped/swiglu/api.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: dc3ac38f7d6fdd0ccfb760962f8f6c19ab46c1c4edba987ae42411a7e7592233
 ---
 # cuDNN 开放 Kernel：MoE 融合、FROST 与稀疏 Attention
 
@@ -150,7 +174,7 @@ BSA 的 BF16 自动 split 策略采用 host-visible 元数据，性能假设是 
 
 当前 BSA KPage 把部分有效的16行 KV page 汇入 MMA tile。`kpage=True` 当次建布局会同步 host，应把固定稀疏图的布局建设放出稳态；稀疏图变化则重新计入成本。其 BF16 backward 支持 GQA，但要求 blk128、padding 行 dO=0，blk64 KPage 仅 forward；它不接收普通路线的 pack_gqa/kv_splits/CLC 调度参数。
 
-IndexerBackward 已移除 `backend="sm100_v2"` 选择器；SM90 要求 H64，受支持的 SM100-family 路线限定 H32/H64、D128、128倍数 top-k 和正有限 scale，deterministic 仍是 request-or-fail。SM100 普通 BF16 dK 的私有 FP32 scratch 使用列置换并由尾部 cast 恢复，不能把该 scratch 当最终梯度；d_weights 只接受 BF16，不能假装输出 FP32 就获得 FP32 精度。
+IndexerBackward 已移除 `backend="sm100_v2"` 选择器；普通 SM90 路线要求 H64，当前固定 `623ad8ff498a` 的 deterministic SM90 另接受紧凑 H32（内部 M64 tile、外部无须 padding），受支持的 SM100-family 路线限定 H32/H64、D128、128倍数 top-k 和正有限 scale，deterministic 仍是 request-or-fail。SM100 普通 BF16 dK 的私有 FP32 scratch 使用列置换并由尾部 cast 恢复，不能把该 scratch 当最终梯度；d_weights 只接受 BF16，不能假装输出 FP32 就获得 FP32 精度。
 
 SparseAttentionBackward 的 deterministic relay 另支持 SM90；`deterministic_relay_cluster_size` 为计划期选择，改变 scratch 和固定归并，不能在 execute/replay 时切换。SM90 仍需一次 eager warmup，之后固定地址的无分配执行才可捕获。Grouped GLU 的设备门禁现在检查 tcgen05，明确排除 cc12.x；SwiGLU wrapper cache 加入设备身份，多 GPU 不应误复用同一编译对象。
 
@@ -158,9 +182,28 @@ SparseAttentionBackward 的 deterministic relay 另支持 SM90；`deterministic_
 
 源码还新增 Mamba-2 Python graph node、forward/backward/summary 入口，区别于带 erase 的 GDN；当前官方说明指定其 FROST engine 与 chunk/state-checkpoint 合同。这里只作为新模型机制入口，不由 node 注册推导原有稀疏 attention 或 HCU 已支持，完整数值/状态移植需追具体 engine 与测试。
 
+## 元数据缓存与固定归并的新边界
+
+BSA 新增 `block_sparse_attention_backward_metadata`，仅服务 SM90 blk64 普通 backward，且与 KPageLayout 互斥。预处理对象绑定 metadata 的 storage、shape、stride、in-place version、序列长度及 bucket 选择；改写 mask 或换对象必须重建，不能只看稀疏密度。它可在侧流准备，但 backward 流仍须 event 排序；对象被消费后由实际执行流记录存储寿命。省去重复元数据 kernel 不改变 BSA/Sage FP8 的精度与反向支持边界。
+
+DSA SparseAttentionBackward 新 `deterministic_dkv_mode` 在 plan 期选择 records、chain 或 shards；默认 records 按设备/后端与 workspace 比较解析，SM90 显式 relay 会选 shards。chain 有自己的架构/后端限制且不能与显式 relay size 组合。各模式分别可复现但舍入顺序不同，不能仅凭 deterministic=True 把它们混作同一逐位基线；workspace 要向实际执行设备上的 plan 查询，不能跨 SM 数不同的设备沿用容量。选择、输出与 scratch 均在 replay 前固定。
+
+SM90 可选 `return_cli_target` 另输出 Top-K 形状的连续 FP32 teacher target，要求64-head padded block 及显式有效 head 数；直接 plan execute 的输出存在性必须与编译选项一致。它不是普通梯度结果中的默认新增字段。Indexer Top-K 对 SM121 也沿用所列 SM120 deterministic 容量限制；不能从架构更新推导任意列数支持。
+
+FROST GEMM 的非标辅助广播采用原 storage 与逐 consumer 的 IndexMap，只有全部访问符合旧 per-K 特例才降为旧辅助 ABI。构图、量化和缓存复用需保留逻辑映射、view、dtype 与 operand 方向，不能通过把辅助张量强行 reshape 为主张量布局来伪造支持。
+
 ## 本次补充的实现与测试依据
 
 - [nvidia-cudnn-frontend: python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py)
 - [nvidia-cudnn-frontend: python/cudnn/deepseek_sparse_attention/indexer_backward/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/deepseek_sparse_attention/indexer_backward/api.py)
 - [nvidia-cudnn-frontend: python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py)
 - [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/_pygraph.py)
+
+## 2026-11-18 固定依据
+
+- [python/cudnn/block_sparse_attention/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/block_sparse_attention/api.py)
+- [python/cudnn/deepseek_sparse_attention/indexer_backward/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/deepseek_sparse_attention/indexer_backward/api.py)
+- [python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py)
+- [python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py)
+- [python/cudnn/gemm/frost/graph_analyzer.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/gemm/frost/graph_analyzer.py)
+- [python/cudnn/gemm/cutedsl/grouped/swiglu/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/gemm/cutedsl/grouped/swiglu/api.py)

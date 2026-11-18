@@ -9,8 +9,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: baidu-baige-loongforge
   path: loongforge/embodied/distributed/checkpoint.py
@@ -52,7 +53,11 @@ sources:
   path: tests/embodied/unit/test_tensor_wise_optimizer.py
   commit: 042a68102395b9f4024d1a61084592c4c618371a
   sha256: 8fba57ed452b8c0b88472ec1a0faee388fbeabfc7a7c8a6aa678a4d3d4a76a0b
-retrieved_on: '2026-11-04'
+- source: baidu-baige-loongforge
+  path: loongforge/embodied/distributed/checkpoint.py
+  commit: f42f0613034c140e98d056b63ce8a37c694d1f81
+  sha256: b6bd1b8ef3f4a31672f873a673d112ce7b8f42270ba9c2a67c0b042a7ad06331
+retrieved_on: '2026-11-18'
 ---
 
 # LoongForge Torch-native：异步保存完成投票与 DCP 恢复
@@ -88,6 +93,12 @@ Embodied Torch栈用`resume_meta.json`标记可恢复checkpoint。若只在下�
 ZeRO rank-local 状态现在先 `_cpu_snapshot`，再后台 `torch.save`；`_merge_futures` 等 DCP upload 与 ZeRO writer 全部结束后传播首个失败/取消，完成 marker 不能只看 DCP 一端。DCP staging 同步失败时按 `LOONGFORGE_ZERO_SAVE_DRAIN_TIMEOUT`（缺省 600 秒）有界等待 writer，超时不保证后台写线程已停止。文件 API/Future 完成也不构成已验证的掉电持久性或共享存储故障原子性。`FinetuneTrainer._save_checkpoint` 已传入 `data_cfg`，且需要 save_processor_config 开关命中才写 processor_config；自定义 trainer 仍逐项核对。
 
 固定版本还存在一个静态可见的不对称：`_save_zero_optimizer_state` 将 `child.optim` 交给 `_local_optimizer_state_dict`，而 `_load_zero_optimizer_state` 通过 `_rank_local_optimizer` 将 tensor_wise 外层交给恢复 hook。`TensorWiseOptimizer.local_checkpoint_state_dict` 才包含 backend、manifest、FP32 master、param_sync_residuals 与内部状态；普通 inner state 不满足 `load_local_checkpoint_state_dict` 首先要求的 backend 身份。这不是没有 `.optim` 属性，而是保存端绕过外层完整状态 hook。`TensorWiseTrainer` 已拒绝 LoRA/非 DCP 的训练状态保存，但这一格式门禁不解决上述 payload 差异。上游存在 `test_checkpoint_round_trip_is_bitwise` 等测试，本轮未执行，不能按测试名宣称此固定版本完整恢复。采用前必须在实际配套确认修复与 save→load 的 master/下一步更新等价性；暂保留已验证训练栈/optimizer 的可信 checkpoint。
+
+## Legacy fused/capturable step 的设备恢复
+
+2026-11-18 固定父仓 `f42f0613034c140e98d056b63ce8a37c694d1f81` 新增 `_move_fused_step_to_param_device`。调用点仅位于 `_resume_legacy` 的普通 `optimizer.load_state_dict` 分支之后；dmuon/FSDP 专用分支不经过此调用。ZeRO 场景逐个找到实际持有 state 的 rank-local optimizer，仅对 fused/capturable 参数组，将 tensor 类型的 Adam `step` 放回对应参数设备，避免恢复后下次 fused step 读取 CPU step。
+
+这不是全量 optimizer 状态迁移，也未改写本页原有异步完成投票、marker 次序或 tensor-wise 保存/加载 payload 不对称。采用时检查实际 optimizer 分支、step 设备、FP32 master 与下一步更新等价性；不能由这个局部修复宣称所有 checkpoint 格式已完整恢复。本轮为固定源码复核，未执行上游或 HCU 恢复测试。
 
 ## 固定证据与复核范围
 

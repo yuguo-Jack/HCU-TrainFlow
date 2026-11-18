@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/distributed/PARALLELISM_CONTEXT.md
@@ -74,7 +74,34 @@ sources:
   path: torchtitan/models/common/moe/token_dispatcher.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 1565face09bffc7246f1d9ddc1a1304fe814ade500605df2f66517fd8a270dfa
-
+- source: pytorch-torchtitan
+  path: torchtitan/config/parallelism.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: ce39315121bbcedd38e584eea1d39d452f07db04a520cfd8c988aa7260329d8d
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/fsdp.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: a66e3d1d82ed1c792bcfa2b3070f36bcb2f97cb809e1d1c8e5b213768232744d
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/activation_remat.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 362ef9fe3fe98768aaeeff731bf75735ad85b69fb0a8797dbe211fc2e403421e
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/ACTIVATION_REMAT.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: b885d1cde8dbed2d3d793cf897787ad39fcd1b74359a16e041fcbb626ce15f8d
+- source: pytorch-torchtitan
+  path: torchtitan/training_engine.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: ecbe72af3cdf4eba9d8093eb07c6178b2046063e87e574ed0d43f5861ab982ab
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/parallelism_context.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 4d6cf3c45d7efb6d3da131ce1b29644ee6904fa057dc54fbce5823cad84dfac5
+- source: pytorch-torchtitan
+  path: torchtitan/rl/MODEL_STATE_DICT_TRANSPORT.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: c0a9a44177743c4f3acf3cfb803f0944f48b69174078bf777c5cd32171eed92b
 pr_sources:
 - pr-pytorch--torchtitan-5101
 - pr-pytorch--torchtitan-5280
@@ -145,11 +172,11 @@ PR #5266 的上游实验也提醒：视觉编码器减少 FSDP 通信后，指�
 
 `fsdp_lifecycle.fsdp_partial_backwards` 保存并恢复各 group 的 post-forward mesh、reshard、reduce 与 HSDP all-reduce policy；有外层 backward 或手工 finalization 时保留未归约梯度和预取状态，不能用一次 public sync setter 覆盖独立 HSDP policy。PP metadata inference 结束还对 FSDP stage 注册 `reset_iter_state` 清理。评估 chunked loss、split backward 与 Graph 组合时同时检查参数驻留、输出 hooks、归约次数和异常后的 finally 恢复。
 
-DeepEP 与 HybridEP 的 dispatch/combine 共享 `ep_communication` remat 选择，不能一个保存、另一个重放：backward 还消费 forward handle。DeepEP 使用确定性排序 buffer；HybridEP 的 prefix scans 保持 token 顺序。全量重算会一起重放两端通信，省显存不等于消除通信或 host 等待。
+HybridEP 的 dispatch/combine 仍按其 `ep_communication` policy 与 forward handle 配对；DeepEP 当前只有 dispatch 按该策略重放，combine 强制保留，不再一起重放。DeepEP replay 需要确定性排序，HybridEP 依赖 prefix scans 顺序。保存/重放影响通信次数与生命周期，连同 score、padding、梯度与专家顺序验收；Dist-MoE 的 dtype/硬件门禁另行保留。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/distributed/PARALLELISM_CONTEXT.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/PARALLELISM_CONTEXT.md)
 - [torchtitan/distributed/parallelism_context.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/parallelism_context.py)
@@ -185,3 +212,16 @@ DeepEP 与 HybridEP 的 dispatch/combine 共享 `ep_communication` remat 选择�
 - [torchtitan/distributed/fsdp_lifecycle.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/fsdp_lifecycle.py)
 
 - [torchtitan/models/common/moe/token_dispatcher.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/moe/token_dispatcher.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+`parallelism.fsdp_unshard_in_current_stream=False` 为默认。开启后 pre-forward/pre-backward gather 在计算 stream 的内存池分配，目标是减少跨 stream 碎片；通过显式 prefetch 仍可提前发通信，但 copy-in/dtype cast 不再与计算重叠。支持前提是 `tok_embeddings → layers → norm/lm_head` 的 decoder 链；MTP、多模态 encoder 与 Flux 被明确拒绝。需要比较峰值、copy/cast、prefetch 与整步时间，不将同 stream 推导为无通信或通用更快。
+
+remat 新增 `BlockRematOverride`，按原模型的精确 `layers.<id>` 或 `<encoder>.layers.<id>` 选择，PP 仍保留全局 layer ID。字段 None 继承基策略，设置则替换；recompute pattern 仍优先，重复 block 拒绝，未命中实际模型却可能静默忽略。固定 Full/Default 预设拒绝覆盖，定制须使用 `ActivationRematConfig` 并检查实际 trace，不能只证明配置解析成功。文档已迁到 `ACTIVATION_REMAT.md`。
+
+较窄 dtype 的冻结参数可减少真实驻留，前提是不在 preserve_dtype 集且在 FSDP 前转换；它不能推广为所有参数或 optimizer state 都减少。NUMA binding 上移到 TrainingEngine 设置设备后、FSDP/pinned batch/EMA 分配前。新 RL 默认又引入 trainer pinned staging，与 generator prefetch、KV、逐组临时 storage 分开计量，见[同步案例](../cases/rl-weight-sync-memory.md)。size-1/inactive mesh 现在使用 fake backend，不能把这些无 collective 轴的通过当真实扩展证据。
+
+固定入口：[torchtitan/config/parallelism.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/config/parallelism.py)；[torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/distributed/fsdp.py)；[torchtitan/distributed/activation_remat.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/distributed/activation_remat.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

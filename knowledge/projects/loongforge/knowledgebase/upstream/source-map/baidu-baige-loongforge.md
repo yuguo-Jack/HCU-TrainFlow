@@ -10,12 +10,12 @@ stages:
 - optimize
 - fault-tolerance
 sources: []
-generated_body_sha256: 499b329b6d887bd7ca754dcce7ff093d8209ce1d64f52e610ece1e8e3bdfe609
+generated_body_sha256: acdd431714e09430657a854f6af9ee0a11c302fc9a801dd909900d8e21685f25
 ---
 
 # baidu-baige/LoongForge：固定版本与在线入口
 
-Commit `042a68102395b9f4024d1a61084592c4c618371a`
+Commit `f42f0613034c140e98d056b63ce8a37c694d1f81`
 
 [官方仓库](https://github.com/baidu-baige/LoongForge) · [PR 联搜](https://github.com/baidu-baige/LoongForge/pulls)
 

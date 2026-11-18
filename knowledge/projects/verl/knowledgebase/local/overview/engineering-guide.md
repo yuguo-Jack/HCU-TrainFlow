@@ -10,8 +10,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: fixed source delta and current V1/backend/restore consumers; historical evidence retained; no HCU runtime validation
 sources:
 - source: volcengine-verl
   path: README.md
@@ -105,6 +105,47 @@ sources:
   path: verl/utils/megatron/low_precision.py
   commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: e2dfe5523dd731f2baddc04d5a8bf60560592e41d977e24f51f33bbab361aa08
+- source: volcengine-verl
+  path: README.md
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: 11bb568ff2644ddb595580eb18d61df10ecb2d3f9b453ad396dcf59da108d7ab
+- source: volcengine-verl
+  path: pyproject.toml
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: b78d5f691367d158c2c0a3c55f6483979a2cb87b62832359b0d2e4e76f4ffb27
+- source: volcengine-verl
+  path: verl/trainer/main_ppo.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: b5fa23c8722376520e13784cb211ac14d285dedc3b802ebfb85b6489457966df
+- source: volcengine-verl
+  path: verl/trainer/ppo/v1/__init__.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: 82af7aa18d3d90a46a0f87605d4f7105e0b17659a48380b3e50fb5d878be6032
+- source: volcengine-verl
+  path: verl/trainer/ppo/v1/trainer_base.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: f96ea47392927d1f870b0f382492addafa6d359b8e4ecb9c8395384da8c9e74d
+- source: volcengine-verl
+  path: verl/trainer/ppo/v1/trainer_sync.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: bc805f2990910f29e11b45c43a0687eae645cee375ab6b9a7211650022f00186
+- source: volcengine-verl
+  path: verl/workers/engine/base.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: d2cc65110b8f380f51f2b90dbd6b36004ddbeb70e59ecde7587fcb9005715770
+- source: volcengine-verl
+  path: verl/workers/engine_workers.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: eb9d1e40aee0443f85f23b499ee9d34cff15cf39f2d28271b5948fd0952e6175
+- source: volcengine-verl
+  path: verl/workers/engine/fsdp/transformer_impl.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: ff7266496cede77ddce70668acdf4c28d6e499a46b996f51fab9e6454a232153
+- source: volcengine-verl
+  path: verl/workers/engine/megatron/transformer_impl.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: f788e47138b7703c443a38ee935f77a4636a03ead24057f08b6d3fb19eacdfe5
+retrieved_on: '2026-11-18'
 ---
 
 # verl：RL 数据流、训练后端、动态批次与权重同步指南
@@ -113,14 +154,14 @@ sources:
 
 verl 将 rollout、reward、reference/value、advantage 与 actor 更新表达成分布式数据流，并接入 FSDP/FSDP2、Megatron 等训练和 vLLM/SGLang 等生成后端。优化对象是整个 RL 迭代的关键路径，训练 kernel 高效不代表生成、调度和权重发布同样高效。
 
-2026-11-04 固定官方 `verl-project/verl` main `31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe`；旧 `volcengine` 的来源 ID 为兼容保留。HCU 的 verl-das 可能采用 **父补丁仓 + third_party/verl 固定子模块**，以 HCU-Knowledge 确认实际 gitlink、注入入口和依赖版本，不能把本页 main 直接替换当前主体，也不套用顶层 `pip install -e .`。本轮没有 HCU 训练运行。
+2026-11-18 固定官方 `verl-project/verl` main `b0871fd89d19329d8c9ed58e5402b11dcf920b64`；`volcengine` 来源 ID 为兼容保留。旧 `31cfccb4` 的模型/量化/固定测试观察保留原适用范围，当前入口已全面转向 V1。HCU verl-das 的父 patch、third_party/verl gitlink 和注入路径独立核对，不能用本页 main 替换现场主体或套用顶层 pip 安装。本轮没有 HCU 训练、设备或恢复实测。
 
 ## 2. 工程地图
 
 | 入口 | 职责、下一层 |
 | --- | --- |
 | [`verl/trainer/main_ppo.py`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/trainer/main_ppo.py) | Hydra 配置、Ray driver、TaskRunner、资源/角色选择 |
-| `trainer/ppo/ray_trainer.py` | `RayPPOTrainer.fit`、rollout/训练编排、负载平衡、save/load |
+| `trainer/ppo/v1/{trainer_base,trainer_sync,...}.py` | 当前 trainer registry、KVBatchMeta/TransferQueue、调度与 save/load；旧 ray_trainer.py 已移除 |
 | `trainer/ppo/core_algos.py` | advantage/policy loss 注册、GRPO、聚合分母；从算法名继续到函数 |
 | `trainer/config/`、`workers/config/` | YAML 组合与 dataclass 校验；实际解析值比脚本覆盖项更可靠 |
 | `workers/engine_workers.py` | TrainingWorker、ActorRolloutRefWorker、训练/推理与权重更新的 RPC |
@@ -160,9 +201,13 @@ README 说明 `recipe` 已迁到独立 `verl-project/verl-recipe`，需要时 `g
 
 ## 6. 核心调用链
 
-`main_ppo`/TaskRunner → 创建资源池与 worker → `RayPPOTrainer.fit` 恢复状态并初次同步权重 → 生成 response → reward/old/ref logprob 和可选 value → rollout correction/advantage → critic 与 actor 更新 → checkpoint/权重发布 → 下一批生成。
+当前 `main_ppo` 无条件进入 `TaskRunnerV1`，由 `get_trainer_cls(config.trainer.v1.trainer_mode)` 选择已登记模式，强制 TransferQueue 并创建 AgentLoopManagerTQ 或显式自定义 manager。`trainer.use_v1=False` 不再恢复旧 `main_ppo_v0/RayPPOTrainer`，已删除的路径不能当下载失败或当前运行入口。V1 base 从 replay buffer 取 KVBatchMeta，沿 reward→balance→old/ref logp→value→advantage→critic/actor update 传递队列字段；sync 模式在加载 checkpoint 后和每步末发布权重，采样后 sleep replicas。其他模式有各自 hook，不套 sync 次序。
 
 训练 driver 通过 `TrainingWorker.train_mini_batch/train_batch` 进入 BaseEngine 对应后端；Megatron 到 MCore forward/backward schedule，FSDP 到其 model/autograd。rollout 的概率是行为策略；重算的 old probability 是固定 proximal anchor；本次 optimizer 更新的当前概率又是另一份。`bypass_mode` 省重算但改变两策略/三策略与校正流程，需要数值验证。
+
+README 将旧 fully-async/one-step-off trainer 的后续入口指向 verl-recipe（其说明固定 verl v0.9.1）；这不等于当前 V1 registry 中的 colocate_async/separate_async 类与旧路径是同一实现。复用旧脚本时先确认实际模式、配置和依赖锁，再决定迁移。TaskRunner 与 fit 的 finally 均关闭 dataloader，随后结束 tracking/TQ；这不是远端生成任务已停止的回执。
+
+worker dispatch 新区分 `is_mp_src_rank()`（接收输入的 rank）与 `is_mp_src_rank_with_outputs()`（收集输出的 rank），默认可相同，backend 可以覆盖。PP、实际数据分发和结果归属分别核对，不能用某个输出 rank 的局部状态冒充全部输入已处理。
 
 ## 7. 性能、并行与内存专题
 
@@ -178,6 +223,8 @@ README 说明 `recipe` 已迁到独立 `verl-project/verl-recipe`，需要时 `g
 量化路径现已重新划界：旧FSDP `QATConfig/apply_qat` 接入从actor schema、QAT公开导出和FSDP engine移除；Megatron保留ModelOpt QAT，并拒绝它与TE FP8训练同时开启。NVFP4 routed-expert训练则使用独立per-module recipe与runtime attestation，保留BF16参数给Adam/refit；rollout只允许vLLM的per-token NVFP4输入量化，并核对BF16层carve-out一致。原static input scale观察器叙述不再适用，见[权重专题](../topics/weight-cache-and-checkpoint.md)。
 
 THD padding由真实低精度recipe给出 `quant_align_size`，input/labels与蒸馏teacher top-k使用同样CP布局和局部组；旧use_fp8_padding布尔不能表达NVFP4。官方另新增VeOmni同节点低精度reduce-scatter选项，默认关闭且只适用CUDA FSDP2/混精与固定VeOmni版本；临时buffer与小bucket代价要独立测量，不把文档入口当作HCU通信已支持。
+
+本轮 fused head 新接 TileLang top-k 标签，蒸馏/score-centering 必须与 policy target 一起保持 THD/CP/Ulysses padding 和 target shift；普通 Triton/Liger 仍限每 token 一个 label。FSDP batch_invariant 明确拒绝 use_fused_kernels，不能因新 top-k 入口放开就组合所有数值模式。当前 VeOmni SFT extra 只增加 tilelang 安装项，不是 HCU 支持或更新活动环境的授权，详见[loss 专题](../topics/dynamic-batch-and-loss.md)。
 
 ## 8. 精度、排障与恢复
 
@@ -201,3 +248,17 @@ Megatron checkpoint加载现在会先把offload optimizer搬回设备，再让Hy
 本地 [source map](../../upstream/source-map/volcengine-verl.md) 和[官方原文](../../upstream/docs/volcengine-verl)用于继续定位。问题无本地答案时 `wiki-search-pr "dynamic batch max token" --engine verl`，读取正文/review/diff 后查相同 commit 的训练调用者和测试；PR有用不代表已进入当前 HCU gitlink。
 
 更新 main 或 HCU gitlink 后同时复核总览、专题、对应案例、配置 schema、backend 与 patch 签名。当前精读核心 PPO/GRPO、动态批次、Megatron 部分门控、weight sync/checkpoint；SFT/多模态/蒸馏与所有实验算法/推理 backend 尚未全量审阅，亦没有本轮 HCU实测。
+
+
+## 2026-11-18 固定消费者
+
+- [README.md](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/README.md)
+- [pyproject.toml](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/pyproject.toml)
+- [verl/trainer/main_ppo.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/main_ppo.py)
+- [verl/trainer/ppo/v1/__init__.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/ppo/v1/__init__.py)
+- [verl/trainer/ppo/v1/trainer_base.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/ppo/v1/trainer_base.py)
+- [verl/trainer/ppo/v1/trainer_sync.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/ppo/v1/trainer_sync.py)
+- [verl/workers/engine/base.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/engine/base.py)
+- [verl/workers/engine_workers.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/engine_workers.py)
+- [verl/workers/engine/fsdp/transformer_impl.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/engine/fsdp/transformer_impl.py)
+- [verl/workers/engine/megatron/transformer_impl.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/engine/megatron/transformer_impl.py)

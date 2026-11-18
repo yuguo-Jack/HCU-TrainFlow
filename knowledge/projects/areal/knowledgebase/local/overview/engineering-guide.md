@@ -10,8 +10,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: fixed delta and actual rollout/training/recovery consumer review; no HCU runtime validation
 sources:
 - source: inclusionai-areal
   path: README.md
@@ -161,8 +161,37 @@ sources:
   path: areal/engine/megatron_utils/packed_context_parallel.py
   commit: 27879753c7611fee9a0af6e71a4f838db27b72a7
   sha256: 04aca90d0958126880ba225f93b9c51b0ada3b1c38d1f88988b476179810b734
+- source: inclusionai-areal
+  path: areal/api/cli_args.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 33f21c95db99a9a19d4ce04fe71b8815463ee1f6652e0b1a8669d52e39b190a6
+- source: inclusionai-areal
+  path: areal/trainer/rl_trainer.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 214492d9b38266926567743f834f1ae74b2bda672fdf1dabf79c5a02d55e7886
+- source: inclusionai-areal
+  path: areal/utils/recover.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: b5ef765dda8477b6b1fc971d0919a772975a29fca5d3a43279e96ed34ecc0524
+- source: inclusionai-areal
+  path: areal/v2/training_service/controller/controller.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: a5769afffb3266a6223eefa3a5cbef67afdf1ca227b2bfa710c36c300a3497cb
+- source: inclusionai-areal
+  path: areal/engine/megatron_engine.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 07564619f0844ed02627defcb408afbc162f2d9dd4fb8ed5ce72ca0c4d0d3681
+- source: inclusionai-areal
+  path: areal/engine/fsdp_engine.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 2702eb65b8a930d4cd3a48504f088be69916a9e5f147c839794b82eb8c6f66d5
+- source: inclusionai-areal
+  path: areal/v2/inference_service/sglang/launch_server.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: f1afe94194bf36788308285989982a600b67b315096f68cb3ab8f089906361b5
 pr_sources:
 - pr-areal-project--areal-1546
+retrieved_on: '2026-11-18'
 ---
 
 # AReaL 工程指南
@@ -171,7 +200,7 @@ pr_sources:
 
 AReaL 将 rollout、reward/agent 工作流、PPO/GRPO 更新和资源调度分开，使生成与训练能够异步推进；训练端可用 FSDP 或 Megatron，推理端可用 SGLang/vLLM。主要优化对象除了训练 kernel，还包括生成尾延迟、样本版本、权重交接、共享显存和 reward 等待。
 
-2026-11-04 固定官方 `27879753c7611fee9a0af6e71a4f838db27b72a7`，包声明为 **2.1.1**；来源登记 ID `inclusionai-areal` 保留兼容，官方工程目前使用 `areal-project/AReaL`。HCU patch 工程是另一条版本线。先用 HCU-Knowledge 确认真实主仓、基础提交、推理依赖和模型脚本，再联查本页；不能将最新官方依赖覆盖进旧 HCU 环境后认为已经完成升级。
+2026-11-18 固定官方 `7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e`，包声明仍为 **2.1.1**；来源 ID `inclusionai-areal` 保留兼容，工程入口为 `areal-project/AReaL`。HCU patch 是另一条版本线，先由 HCU-Knowledge 确认真实父/子提交、推理依赖和模型配方。旧 `27879753` 的依赖、固定测试和机制观察保留原适用范围，不把当前官方内容自动升级成 HCU 部署。
 
 本轮阅读了配置、真实 recipe、训练/rollout 控制和选定测试，**没有执行 HCU 运行、性能或恢复测试**。
 
@@ -237,7 +266,7 @@ recipe / load_expr_config → PPOTrainer / RLTrainer
 
 AWEX v1 colocated 是重要例外：当前先保存训练状态，再转移权重，以免推理恢复后的显存与保存瞬态叠加。`maybe_wait_for_staging` 位于修改 actor 参数之前；它保护异步 checkpoint 的参数快照。底层性能和数值仍应追到 Megatron/TE、FSDP/Torch、SGLang/vLLM 的**实际依赖提交**。
 
-v2 的权重更新成功语义需要单独验收：gateway 传输失败可返回 HTTP 200 的 `status="error"`，当前 GatewayTrainController 未检查该业务状态就继续 generation，上层还可能推进版本。函数返回或 HTTP 成功不足以确认实际安装，详见[版本与恢复专题](../topics/async-version-and-recovery.md#2-权重发布与暂停协议)。AWEX colocate plugin 同时限制已核对的 SGLang 版本并拒绝不兼容的 allocator 配置，不能直接采用 SGLang 最新主干覆盖当前消费者。
+v2 当前先 `rollout.set_version(meta.version)` 再在 finally 中 `continue_generation()`，修正正常发布窗口的 token-version 标记顺序；它仍未检查 weight-update gateway 的业务 `result.status/error`。HTTP200 携 error、版本广播异常与实际权重安装成功是不同状态，finally 恢复生成也不能当成功证据；详见[版本与恢复专题](../topics/async-version-and-recovery.md#2-权重发布与暂停协议)。AWEX colocate 依赖版本 allowlist 和 allocator 约束仍适用，不能直接混用最新 SGLang。
 
 ## 7. 性能与显存：机制、代价和选择
 
@@ -253,9 +282,13 @@ Profiler 应同时抓 train/rollout/reward/weight-update；官方 `perf_tracer` 
 
 新增 `rollout.mask_stale_tokens` 默认False，启用后只屏蔽过期actor/MTP目标的分子，保留context、reward/advantage与原loss分母；它不是丢弃整条rollout或重新定义admission。当前mask未排除未来版本，而日志单独报告future_version_fraction，需核对实际权重/版本来源，不能把开启mask当作一致性证明。
 
-`use_score_centering` 则选择独立REINFORCE surrogate，不是clipped PPO的性能选项：只支持普通FSDP actor、native SGLang RLVR、temperature=1、未截断随机采样、保留sampler head与行为logp；拒绝重算logprob、tree/critic、distillation及不兼容surrogate。TP/CP还有等宽词表与packed head对齐要求，详见[目标专题](../topics/loss-aggregation-and-packing.md)。
+`use_score_centering` 选择独立 REINFORCE surrogate，当前从普通 FSDP 扩展到受限 Megatron TP/CP/PP；仍需 native SGLang、temperature=1、未截断随机采样和 sampler head/行为 logp，Megatron 另拒绝 chunked LM head、MTP 和有梯度 entropy。单 teacher 的 pure-KD 与联合 KDRL 公式本轮也改变，不能保留旧 loss 曲线为同一目标，详见[目标专题](../topics/loss-aggregation-and-packing.md)。
 
 观测窗口也变为随结果消费：quality scalars先留在各task，trainer形成batch时才计入ConsumedMetrics，包含已消费的rejected attempts，排队/预取的未来结果不计入当前窗口；episode与group的count不是最终训练行数。PRM/运行指标仍用原wall-clock scope，不能把两种分母混在一个reward曲线解释里。
+
+本轮可选 `rollout.backend_routing` 只允许 v1 single-controller 的 RemoteSGLangEngine；controller、发送方和 backend lease 各有暂停状态。权重发布前先 fence sender、排空执行再暂停 native generation；不确定的执行使 pool 失败而不是自动重放。RecoverHandler 也将失败保持 admission paused 扩大到所有已开始恢复/发布的分离式路径，不能再仅对 colocated 套用；详见[版本专题](../topics/async-version-and-recovery.md)。
+
+多模态 FSDP 新增 video payload，并在 Qwen-VL vision tower 前移除文本 packing kwargs，mRoPE 参数按实际 Transformers 签名传递。AWEX 启动路径新增 ROCm fa3 fallback：只有 torch.version.hip 存在且所选 backend 为 fa3 时，确定性推理选 triton，否则选 aiter；它不证明 HCU 对应 kernel、SGLang allowlist 或视觉配方已经兼容。
 
 ## 8. 精度、故障与恢复的排查顺序
 
@@ -287,3 +320,14 @@ AWEX SGLang plugin在成功flush后还检查视觉embedding cache：未知/未�
 - [areal/v2/weight_update/controller/controller.py](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/areal/v2/weight_update/controller/controller.py)
 - [areal/v2/training_service/controller/controller.py](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/areal/v2/training_service/controller/controller.py)
 - [areal/engine/awex/plugins/sglang_plugin.py](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/areal/engine/awex/plugins/sglang_plugin.py)
+
+
+## 2026-11-18 固定消费者
+
+- [areal/api/cli_args.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/api/cli_args.py)
+- [areal/trainer/rl_trainer.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/trainer/rl_trainer.py)
+- [areal/utils/recover.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/utils/recover.py)
+- [areal/v2/training_service/controller/controller.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/v2/training_service/controller/controller.py)
+- [areal/engine/megatron_engine.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/engine/megatron_engine.py)
+- [areal/engine/fsdp_engine.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/engine/fsdp_engine.py)
+- [areal/v2/inference_service/sglang/launch_server.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/v2/inference_service/sglang/launch_server.py)

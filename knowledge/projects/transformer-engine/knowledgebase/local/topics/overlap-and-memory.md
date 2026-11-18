@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
@@ -58,7 +58,28 @@ sources:
   path: transformer_engine/pytorch/module/grouped_linear.py
   commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 81285c46ceb62f2b01fe4331ca6c74de18f0ccc1f81085d5d6509b00b98ac9ce
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/graph.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: fc572e3a4c0531d69e8c99ed9d7e0cdd9c3cbb9e8c12beee07c7d3b88bdee06c
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/module/base.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 179b03c50a372173634e598e94066fcc99a9fad248475e5e429c34c743770948
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/module/linear.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 2a0df591bfde1c3cb5eee4c55bc479f16a09657f975feff603e1e666f9c91c5b
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/module/layernorm_mlp.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 194663497726c5cd52b0679b3743e3430797460a38e0206c62edffaebad52779
+- source: nvidia-transformerengine-docs
+  path: advanced-optimizations
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: c977c8d5cc732d9bb29b43914503a926f139746296f0d390a7b185b128ffe16c
 ---
+
 # TE 并行与显存：Userbuffers、CP、Graph 和 Offload
 
 ## TP/SP 通信与计算重叠
@@ -78,6 +99,8 @@ HCU 侧先确认当前 TE 已支持的 overlap 路径、通信实现和 buffer �
 `graph.py:make_graphed_callables` 除捕获 kernel 以外，还处理训练相关上下文与 FP8 状态。捕获/重放前后检查输入地址与形状、RNG、参数版本、量化副本及梯度存储是否符合约定。把 warmup/编译/capture 分开计时；graph 可能消除 CPU launch 空泡，但不能说明单 kernel 已达到上限。
 
 当前延后 wgrad 捕获先在 graph pool 中建立独立结果，保留每个 callable 的静态梯度，避免普通 allocator 的 warmup grad 被 `zero_grad` 释放。`backward_dw` replay 后仍由 Python 将贡献 clone/add 到参数梯度，再触发 delayed-grad hooks；单纯重放原始 CUDA Graph 不包含这些 Python 赋值。tied weights、多 microbatch、清零、reset 及 hook 顺序须一起回归，不能只测一次 replay。
+
+固定 `8e89d3ad8b2c` 的 Graph 路线已移除旧 `graph_safe_rng_available()` 兼容分支，按新最低框架要求保存默认及额外 generator 状态，为 forward/backward/delayed-wgrad graph 注册并在 warmup 后恢复。它仍依赖匹配的 RNG tracker 和 capture 语义；删除旧版本判断不意味着 HCU 的 Graph/RNG 能力可省略验证。
 
 ## CPU offload 的显存与延迟账本
 

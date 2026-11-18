@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: modelscope-ms-swift
   path: swift/megatron/trainers/rollout_mixin.py
@@ -65,6 +66,19 @@ sources:
   path: swift/ray/megatron/checkpoint_engine/zmq_auth.py
   commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: d49460c04ee081526f16cca6d355c0a7de1f5cb9cee0697c3ce40ec0f024a57d
+- source: modelscope-ms-swift
+  path: swift/megatron/trainers/base.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: 32df3c9347a88e2f16546d2be16130285a8e089addc9b1256af802d0e8dc75b7
+- source: modelscope-ms-swift
+  path: swift/megatron/trainers/rollout_mixin.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: 05b6cb52913ad0116c20f940e9b221f3345a86212f2d9fe935c1e8c9ebe42b4b
+- source: modelscope-ms-swift
+  path: swift/rlhf_trainers/utils.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: c9b2baac6e9c6c2ee6bf6d2d44120f192fabdc13c52bb3247c96d6a2eadfbbfb
+retrieved_on: '2026-11-18'
 ---
 
 # ms-swift Megatron GRPO：权重同步、LoRA 与显存切换
@@ -150,3 +164,9 @@ Ray NCCL 分支的 unmerge/finalize 位于正常 send/receive 返回之后，当
 - [swift/ray/megatron/checkpoint_engine/mixin.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/mixin.py)
 - [swift/ray/megatron/checkpoint_engine/nccl.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/nccl.py)
 - [swift/ray/megatron/checkpoint_engine/zmq_auth.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/zmq_auth.py)
+
+## PEFT 层归属与服务端截断漂移
+
+`cf627bdd5d7e739a6cefc5829ab5696575615e8b` 的 merge/unmerge 遍历现在使用 `isinstance(module, LoraLayer)`，不再只识别旧 `mcore_bridge.LoraParallelLinear`。这会影响哪些层参加权重切换；首次 base sync、adapter-only、异常后 unmerge 与服务端实际权重版本仍逐项确认，不从类型扩大推断 Ray 分支 finally 缺口已经修复。
+
+server 模式初始化将 `get_engine_type()` 返回配置交给 `check_rollout_truncation_config`：两侧 max_length/截断策略不同时只告警；旧服务端缺字段则跳过。核对真实 prompt/token、completion 长度及 processor 设置，保留配置漂移为质量缺口。控制面调用成功与相同策略输入分别验收，原权重/KV/sleep 生命周期没有被这项检查替代。

@@ -15,7 +15,16 @@ sources:
   path: deepspeed/runtime/zero/stage_1_and_2.py
   commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
   sha256: 0dd8a8c856a90e2aa0dae70d8d03f961d1b346800fdcabbf8e29ed149aec8bd8
-reviewed_on: '2026-11-04'
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/stage_1_and_2.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 61e0f21a348f3c98c44c32225ab25e1beddced12f36388a578acb1a608a8a454
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/config.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 34033db3576399499f67ed1b37d90c279a0506dd2b5bddda1715f3c189592f73
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
 ---
 
 # DeepSpeed ZeRO-1/2 offload：梯度所有权与流顺序
@@ -54,10 +63,14 @@ PR 保留原 overlap barrier，并在其上增加约束；修改后也没有一�
 
 2026-11-04 复核官方 master 固定提交 `d8241a9ba266405e1a58fadf19e24b2370f6d7fa` 的 [`stage_1_and_2.py`](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/deepspeed/runtime/zero/stage_1_and_2.py)：大梯度独立存储、bucket ready/reuse event 和 offload copy 等待仍有实现依据。事件/record_stream 路径还检查 accelerator 的 `resolves_data_dependency()`；不能把某后端的显式事件数当成所有设备的执行模式。
 
-本轮同文件增加 compact FP32 gradient partition 与动态 offload 的 view 重建，详见[ZeRO 专题](../topics/zero-state-lifecycle.md)。这些精度/存储改动不撤销本案例的 ready/reuse/record-stream/copy 完成保护；复核时应分别检查“数值保存在哪里”和“谁何时能重写该存储”，不能拿 FP32 累积替代流顺序验收。
+2026-11-04 的同文件增加 compact FP32 gradient partition 与动态 offload 的 view 重建，详见[ZeRO 专题](../topics/zero-state-lifecycle.md)。这些精度/存储改动不撤销本案例的 ready/reuse/record-stream/copy 完成保护；复核时应分别检查“数值保存在哪里”和“谁何时能重写该存储”，不能拿 FP32 累积替代流顺序验收。
 
-当前还新增按参数追踪累积窗口：`_offload_accumulated_param_ids` 判定该参数本step是否已有有效host梯度，而非用全局micro-step数；第一次在boundary出现的FP32 master梯度可暂留partition，`_offload_partition_only_param_ids` 阻止finalize回填过期host存储。若step前再次backward，从owned片段恢复后继续累加，step等待copy并清空两组ID。
+2026-11-04 的固定实现还新增按参数追踪累积窗口：`_offload_accumulated_param_ids` 判定该参数本step是否已有有效host梯度，而非用全局micro-step数；第一次在boundary出现的FP32 master梯度可暂留partition，`_offload_partition_only_param_ids` 阻止finalize回填过期host存储。若step前再次backward，从owned片段恢复后继续累加，step等待copy并清空两组ID。
 
 因此本案例的原ready/reuse/copy保护继续适用，但回归输入应增加晚出现参数、部分参数无梯度、连续多个请求boundary和reentrant重算。compact FP32 partition与这些ID分别控制精度/数值来源，events控制可重写时刻，不能互相替代。ZeRO-3新pinned master路径由[ZeRO专题](../topics/zero-state-lifecycle.md)单独解释，不扩大本PR的修复范围。
+
+2026-11-18 继续核对 `5420b75de3226e95b6412ed2d95380c0a819c89a`：原 ready/reuse/copy 等待仍保留。新的 `_offload_unpublished_param_ids` 要在 boundary 发布先前非 boundary 参与、但本次没有梯度的参数，不能只按“当前 backward 的参数”取 host sum。host accumulator 改为每组懒分配 owned partition，恢复临时量时清零本 rank 片段外区域，避免 overflow 检查读到 scratch 残值。
+
+compact GPU partition 只有在 host 精确保存其值且 safety 路径允许时，才在边界 copy 完成依赖下释放；下一 backward 恢复 host-owned sum。`retain_gpu_grad_partition_until_step=True` 保留该分片到 step，**当前实现仍先执行 D2H**，不能用配置描述替代函数次序或删除 copy 完成事件。回归增加同一窗口多个 boundary、只在非 boundary 参与的参数、overflow 丢弃后的新窗口、不同 host/累积 dtype 及开关两侧的实际峰值和更新。此为共享 ZeRO-1/2 当前路径的演进，不将其归入历史 PR 的原始范围，也不把 ZeRO-3 fused CPUAdam 的新路径并入本案例。
 
 更新时联动 [DeepSpeed 总览](../overview/engineering-guide.md)、[ZeRO 生命周期专题](../topics/zero-state-lifecycle.md)、本案例与实际调用方。PR 的改因、当前主干和现场所用 HCU 分支分别查证。

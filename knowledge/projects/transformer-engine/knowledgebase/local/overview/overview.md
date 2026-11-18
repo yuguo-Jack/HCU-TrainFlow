@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
@@ -46,7 +46,32 @@ sources:
   path: transformer_engine/pytorch/attention/dot_product_attention/utils.py
   commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: a014f57a3600d9c1156d91d6e426bb4ee8fbe0418b1776dbea89be98fcc73be3
+- source: nvidia-transformerengine
+  path: docs/installation.rst
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 86372814c4a1f14ef7be6bbbfd20c707ccd63a0e0bd707cce645b4bf4263fa0e
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/ops/fused/grouped_mlp.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 244df5eb49c4c1d4d87e91e677c1b2971dbe73fe4633ba658aa60d5f40b87f7d
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/csrc/extensions/normalization.cpp
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 601ff099c756b2dbb8d3a8fed6c719733bc6555a59d5a1668a858f6b8dbf88ef
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/quantization.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: d2cc28ae1002f27ea5d3cd1b2c9ceb542d5f74c335d57857a55962ace8900b52
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/graph.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: fc572e3a4c0531d69e8c99ed9d7e0cdd9c3cbb9e8c12beee07c7d3b88bdee06c
+- source: nvidia-transformerengine-docs
+  path: index
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: c563e1c9e35db804f571ee461bac5ec9e318903877452d3be8671e00ea63bb52
 ---
+
 # Transformer Engine 官方工程：定位、目录与训练调用链
 
 ## 为什么训练工作流要单独维护 TE
@@ -87,7 +112,7 @@ TE 不仅是 FP8 开关。训练引擎把 Linear、归一化、MLP、attention�
 
 ## 来源与版本复核
 
-当前机制复核固定官方 main `720b25258be3b60f482afff8aef00d4cad88fa16`，原件采集与语义复核日期为2026-11-04。GroupedLinear 的模块接口、ops-fuser、分布式权重与低精度存储仍须分别追踪；本版新增 BF16 grouped MLP、按 recipe 内容区分的融合缓存，以及延后 wgrad/Graph 累加修正，不能只沿旧大函数行号查实现。attention 新增 Hopper FA4 的 Quack/CUTLASS DSL 组合拒绝条件；RMSNorm-MXFP8 既有 column-only 包装缺口仍保留，详见专题和案例。
+当前机制复核固定官方 main `8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b`，日期为2026-11-18；此前固定来源继续保留。Grouped MLP 的 block-scaled 路线与 BF16 canonical-layout 路线分别检查 cuDNN Frontend 版本、wrapper 能力、设备 offsets、权重布局和梯度累加。RMSNorm 新增 cuDNN compact-scale→GEMM swizzle 路线；默认 TE column-only 包装的形状缺口仍按具体调用条件保留。Graph RNG 与 recipe 准入也已变化，不能用旧 Python helper、环境变量或模块行号代表当前实现；详见对应专题。
 
 - [nvidia-transformerengine: README.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/README.rst)
 - [nvidia-transformerengine: .gitmodules](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/.gitmodules)

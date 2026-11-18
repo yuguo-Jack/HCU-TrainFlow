@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: pyproject.toml
@@ -65,10 +66,46 @@ sources:
   path: megatron/core/optimizer/optimizer_config.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: f83b46a8a901bb7c792076544e2fefda3b76830ef2d971ecb976f0ac557fbc67
+- source: nvidia-megatron-lm
+  path: pyproject.toml
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 141d962c7e08dda1242b6b9e286d2d99c8122815ced92a5c56fe985ab4243a23
+- source: nvidia-megatron-lm
+  path: pretrain_gpt.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 1ba21dabb7284799ec1e7b2e37475e4037f8940452d6d40615d5eeba049c9a40
+- source: nvidia-megatron-lm
+  path: gpt_builders.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: c9ae6bb33f859eeafbb98ca79015510baa694b4d1afbf6c1e7fa0a91f02f927b
+- source: nvidia-megatron-lm
+  path: megatron/training/datasets/providers.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 4a7592946b98eb1d8a8eca33bbc46356ac2f27f4967d08c1b8abc58b32c2591d
+- source: nvidia-megatron-lm
+  path: megatron/training/config/container.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 6fee251020eb4fa1087ea88bdd022b250e2a276910c3f217de8eb49129efd323
 retrieved_on: '2026-11-04'
 ---
 
 # Megatron 安装、模型配置、数据、运行与分层测试
+
+## 2026-11-18：配置所有者和安装范围
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+本次固定官方开发树进一步把模型、data、optimizer、checkpoint、rerun 与 profiling 的消费转到注册的 run config。`pretrain_gpt.get_batch` 读取 `cfg.model.transformer`，数据 provider 读取模型配置和所属 PP group，`gpt_builders` 的词表来自 tokenizer section；临时修改 `get_args()` 不保证改变这些消费者。应在构建前修改 owning section，再按该版本 finalize/validate，并保存最终解析配置、实际 group 与模型结构；不能在 buffer/模型建立后用改 namespace 伪装同一配方已经生效。
+
+当前 `pyproject.toml` 为 training/旧 mlm extra 收紧 gigatoken 下界，inference extra 另有精确配对的 FlashInfer/JIT-cache 及 CUDA-major/架构索引；开发依赖中的 ModelOpt、multi-storage-client 也有变化。这是 NVIDIA 官方开发环境的安装定义，不能把 inference extra、uv 覆盖或 CUDA wheel 清单直接搬进 HCU 训练环境。用户固定 release/commit 的环境仍以其真实制品为准，按需要验证改变的依赖，不能因更新 Wiki 自动安装或切换。
+
+### 本节固定证据
+
+- [pyproject.toml](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/pyproject.toml)
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/pretrain_gpt.py)
+- [gpt_builders.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/gpt_builders.py)
+- [megatron/training/datasets/providers.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/datasets/providers.py)
+- [megatron/training/config/container.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/config/container.py)
 
 ## 安装入口与版本漂移
 

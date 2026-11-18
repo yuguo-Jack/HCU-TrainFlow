@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/rl/trainer/trainer.py
@@ -50,7 +50,34 @@ sources:
   path: tests/rl/unit_tests/cpu/test_engine_loop.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: b9a5defb95961aad5fab4f6cf65705e2e118f74d5292f1b89e3e785b7cc85c0f
-
+- source: pytorch-torchtitan
+  path: torchtitan/rl/MODEL_STATE_DICT_TRANSPORT.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: c0a9a44177743c4f3acf3cfb803f0944f48b69174078bf777c5cd32171eed92b
+- source: pytorch-torchtitan
+  path: torchtitan/rl/model_state_dict_transport.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 13f48f0ed2b0a6b422000979b5463895c5e474f621932e5ffe24cf9eef9f5592
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator/model.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: d0cd8f39610905786265c3b8926e33f23285533d9b1e1dc5013d411e78c7d7df
+- source: pytorch-torchtitan
+  path: torchtitan/rl/trainer/trainer.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 4204515230aac8cee7d9cc836b3709b4b66ca461335f72d21146c17cd1cc9ffb
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator/engine_loop.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 026acfe34ddeefe069614ac2a10e2a17501820d0e260a5ed8afe0c2fe89d4c8e
+- source: pytorch-torchtitan
+  path: tests/rl/unit_tests/cpu/test_model_state_dict_transport.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 545285c0ebd315d40efa3de6bb8be82f0f5a0799b03ca5292530befe74fa04fe
+- source: pytorch-torchtitan
+  path: tests/rl/unit_tests/cpu/test_vllm_wrapper.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: d254cf2b23d7762dc7574d4bcb74b6b8307f0874b871c7e0f64f581cb7df7918
 pr_sources:
 - pr-pytorch--torchtitan-5107
 - pr-pytorch--torchtitan-5268
@@ -63,7 +90,7 @@ RL 权重同步可能同时在 trainer 和 generator 产生大块临时存储。
 
 ## 训练侧：Store 快照与同步所有权
 
-PR #5107 的 pinned CPU mirror 是历史阶段。当前 `Trainer.push_model_state_dict` → `_put_model_state_dict` 直接发布 live 模型 tensor，移除了 `_setup_staging_model_state_dict` / `_stage_model_state_dict`。SharedMemory transport 可直接把 tensor 复制/转换到 StorageVolume；其他 transport 可能按批临时 GPU cast。容量预算应按实际 transport 测 GPU/Host 和 Store，不能继续固定计入 trainer 自有整模型镜像，也不能据此说没有任何暂存。
+PR #5107 的 pinned CPU mirror 是历史阶段。显式 TorchStore 路线的 `Trainer.push_model_state_dict` → `_put_model_state_dict` 直接发布 live 模型 tensor，移除了 `_setup_staging_model_state_dict` / `_stage_model_state_dict`。SharedMemory transport 可直接把 tensor 复制/转换到 StorageVolume；其他 transport 可能按批临时 GPU cast。容量预算应按实际 transport 测 GPU/Host 和 Store，不能继续固定计入 trainer 自有整模型镜像，也不能据此说没有任何暂存。
 
 独立 push stream 在 optimizer 更新最终完成时捕获依赖；worker 将该 stream 设为 current 并同步，因为 RDMA 读可能在 stream 顺序之外。Controller 在下次 optimizer 修改权重前等待 push，在下次 push 覆盖 Store key 前等待所有 generator pull。forward/backward overlap 依赖其不修改 persistent model state；违反该条件会混合两步权重。
 
@@ -71,11 +98,11 @@ transfer dtype 从根 `precision.param_dtype` 与基础 `precision.dtype` 决定
 
 ## 生成侧：按 FSDP group 加载
 
-生成侧平时保留 unsharded 权重，逐组加载仍控制 sharded 临时峰值。当前入口为 `VLLMModelWrapper.load_model_state_dict(fetch)`，取代旧的一次 `load_state_dict` pre/post hooks：按共享 FSDP state 分组，显式 reshard → 分配 sharded storage → fetch 全部该组参数 → unshard → 释放，再处理 buffers。tied embedding/norm/LM-head 同组，不能按单个 module 提前 all-gather；`_reshard` 还处理 FORWARD 状态下 public reshard 会 no-op 的情形，并保持 Graph 使用的 unsharded storage。
+生成侧平时保留 unsharded 权重，逐组加载仍控制 sharded 临时峰值。当前逐组加载入口为 `ModelStateDictLoader.load(fetch)`（现位于 `rl/generator/model.py`），取代旧的一次 `load_state_dict` pre/post hooks：按共享 FSDP state 分组，显式 reshard → 分配 sharded storage → fetch 全部该组参数 → unshard → 释放，再处理 buffers。tied embedding/norm/LM-head 同组，不能按单个 module 提前 all-gather；`_reshard` 还处理 FORWARD 状态下 public reshard 会 no-op 的情形，并保持 Graph 使用的 unsharded storage。
 
-默认 `cpu_prefetch` 在生成期间读完整 pinned CPU 副本，load 再复制；`gpu_fetch` 不建这份副本，暂停 engine 后逐组直接读取 Store，拒绝量化参数，增加同步暴露时间。fetch 在 stream 顺序外写入时，必须先等旧工作及新分配完成，返回前写入完成。
+`cpu_prefetch` 在生成期间读取应同步 trainable 参数与 buffers 的 pinned CPU 副本，load 再复制；`gpu_fetch` 不建这份副本，暂停 engine 后逐组直接读取 Store，拒绝量化参数，增加同步暴露时间。fetch 在 stream 顺序外写入时，必须先等旧工作及新分配完成，返回前写入完成。
 
-每个参数 key 都要填充，缺失报错；gpu_fetch 的 `strict=False` 只允许未发布 buffers 保持原值。某 rank fetch 失败后仍完成剩余组 collective，随后传播错误并让所有 generator ranks 停止 loop，避免其他 rank 卡住或继续使用部分新权重。失败后不能直接重用已污染模型继续 rollout。
+每个本次应同步的 trainable 参数 key 都要填充，缺失报错；gpu_fetch 的 `strict=False` 只允许未发布 buffers 保持原值。某 rank fetch 失败后仍完成剩余组 collective，随后传播错误并让所有 generator ranks 停止 loop，避免其他 rank 卡住或继续使用部分新权重。失败后不能直接重用已污染模型继续 rollout。
 
 ## 上游证据
 
@@ -93,13 +120,13 @@ HCU 接入先查已有 RL/推理工程的同步实现与底层通信库，不机
 
 ## 当前传输 API 与统计范围
 
-MonarchActorSystem 在 trainer mesh 建立 StorageVolume 并初始化所有角色 client；权重 PUT 仍显式 `direct_rdma=False`。Store 快照、generator 可选 pinned CPU prefetch、逐组 GPU 临时 storage 和 KV cache 是不同容量项；RDMA microbatch 数据不混入权重同步收益。
+显式 TorchStore 路线的 MonarchActorSystem 在 trainer mesh 建立 StorageVolume 并初始化所有角色 client；权重 PUT 仍显式 `direct_rdma=False`。Store 快照、generator 可选 pinned CPU prefetch、逐组 GPU 临时 storage 和 KV cache 是不同容量项；RDMA microbatch 数据不混入权重同步收益。
 
 排队 load 可合并到最高版本；gpu_fetch load 只有全部 ranks 读完才完成。Controller 继续等待所有 generator pull 才释放下一批 rollout groups，早完成者可能等最慢者。指标仍为 `trainer_push_model_state_dict` / `generator_pull_model_state_dict`。历史 #5268 的 H100 数字只证明当时 group-loading 改动，不是当前 transport/load-mode 重构后的基准。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/rl/trainer/trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/trainer/trainer.py)
 - [torchtitan/rl/generator/generator.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/generator.py)
@@ -121,3 +148,18 @@ MonarchActorSystem 在 trainer mesh 建立 StorageVolume 并初始化所有角�
 - [torchtitan/rl/generator/engine_loop.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/engine_loop.py)
 
 - [tests/rl/unit_tests/cpu/test_engine_loop.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/rl/unit_tests/cpu/test_engine_loop.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+默认同步已从 TorchStore 专用路径改为 `ModelStateDictTransport`（NIXL，可选 Mooncake）：trainer 将可训练参数与 buffers 按 generator rank 的 shard intersection 预先排到注册 pinned CPU staging，generator 各 rank 直接读到 prefetch buffer，再在加载时 unpack。它无 StorageVolume/key，也不保留 trainer 持久 GPU 快照，但 **trainer pinned staging 重新出现**；旧“无自有 CPU mirror”只适用显式 None 的 TorchStore 路线。`gpu_fetch` 当前仍要求 None，不能把两种后端的容量相加/互换。
+
+loader 抽到 `rl/generator/model.py::ModelStateDictLoader.load`，逐 FSDP group 的显存控制仍适用；trainable 参数必须被本次 fetch 填满，frozen 参数来自匹配的初始 checkpoint。LoRA 等混合 group 在重新分配 shard 后先回填 frozen 值，避免 all-gather 未初始化 base；纯 frozen group 可跳过。generator prefetch 因而主要覆盖 trainable 参数与 buffers，不再无条件等于完整模型权重副本。
+
+初始化规划检查完整、不重叠的 shard 覆盖与 dtype，拒 Partial/uneven StridedShard。push 先完成 stage copy，pull 全部完成后下一 push 才能覆写；packed load 的 copy 也必须完成后才能再读到同 buffer。transport read 超时仍有在途写，来源要求重启而非复用污染 buffer。drain=True 现在由 engine loop 自身排空 admission，False 才 hot-swap，接口见[RL专题](../topics/titanrl.md)。
+
+CPU transport 测试覆盖 HSDP→TP、packed/replicated pieces、缺失/重叠 coverage、混合 dtype/不匹配及 layout 拒绝；模型 loader 的相关测试已从 vLLM wrapper 专用层迁到公共生成层。这里只阅读设计，没有运行上游 CPU、RDMA或设备测试，也未复测历史 H100 性能。
+
+固定入口：[torchtitan/rl/MODEL_STATE_DICT_TRANSPORT.md](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/rl/MODEL_STATE_DICT_TRANSPORT.md)；[torchtitan/rl/model_state_dict_transport.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/rl/model_state_dict_transport.py)；[torchtitan/rl/generator/model.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/rl/generator/model.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

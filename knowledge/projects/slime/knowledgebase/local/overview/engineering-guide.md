@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: thudm-slime
   path: README.md
@@ -109,6 +110,15 @@ sources:
   path: tests/test_server_control.py
   commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: f4d802544e73352c69812900f56e16766cd1ad3173f441445857a11a45751010
+- source: thudm-slime
+  path: slime/backends/megatron_utils/arguments.py
+  commit: 79aa41a884ab0bf65222c94418f6357d3c31192b
+  sha256: 3785007fa2ecdb4a5569e95bedc91542388e3b1c47107e4f9d790b3011ef2a24
+- source: thudm-slime
+  path: slime/backends/megatron_utils/data.py
+  commit: 79aa41a884ab0bf65222c94418f6357d3c31192b
+  sha256: 4ad54bbd49045b60006a91807b92539086055785fec4d284c09ef0acaa855cff
+retrieved_on: '2026-11-18'
 ---
 
 # Slime：Megatron–SGLang 闭环、数据并行与恢复工程指南
@@ -206,3 +216,9 @@ Logprob/entropy chunking 当前通过单一 autograd 节点在 backward 重算�
 相关已收录 PR：[disk delta shard index #2442](../../upstream/prs/THUDM--slime/PR-2442.md)、[保留 serving 的 Megatron 重启 #2444](../../upstream/prs/THUDM--slime/PR-2444.md)。配合版本发布/恢复专题阅读最终实现，并回到 PR 来源查看描述与 review；保留服务不能代替自动故障接管。
 
 在线检索如 `wiki-search-pr "delta restart baseline" --engine slime`，取正文/review/最终代码/测试。更新loss、packing/CP、train loop、data commit或weightsync后同时修订本页、两专题、案例和消费者。当前未全面精读每个模型插件、全部reward/异步组合和所有SGLang接收端实现，也未在HCU训练或故障注入。
+
+## Gloo 兼容值与多模态批接口
+
+固定 `79aa41a884ab0bf65222c94418f6357d3c31192b` 新增 `use_gloo_process_groups(args)`：优先读当前 `use_gloo_process_groups`，缺失时兼容旧 `enable_gloo_process_groups`，再缺省 True。Megatron 校验可能动态关闭 Gloo，须在实际使用点读取最终值；`--disable-gloo-process-groups` 的 flag 名未变，不能把旧字段缓存成独立事实。
+
+多模态训练输入按 key 先收集全部出现的 tensor，保持样本出现顺序；只有所有 tensor 的 `shape[1:]` 一致时才沿维度0拼接，否则保留 tensor 列表。变尺寸图像的 forward/collator 必须接受该 union 类型并保持媒体与 token 的对应，不再假设每个 key 总是一个已拼接 tensor。这两项是参数/数据契约变化，既有权重发布、回滚和恢复证据继续按其固定版本使用。

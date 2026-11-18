@@ -25,7 +25,7 @@
 
 编译器升级时核对实际 intrinsic 累加精度、低精度 packing/scale ABI 和最终代码的等待/同步。源码 load 数量可能因向量化而不同于机器事务数；`vmcnt` 非零不能单独证明有效重叠，目标资源上限也不等于实际 VGPR 用量或 occupancy。按当前 HCU 知识和 kernel Skill 继续查 IR/ISA/性能计数器，不复制另一 gfx 的指令门禁或把 no-NaN 假设当通用加速开关。
 
-Triton/TileLang 的前端选项、流水 pass 和后端工具链须作为同一组合核对。BufferLds copy 转换、数据发布和槽位复用可能由不同 pass 负责；不能从某个转换 pass 没有 wait 推断同步缺失，也不能手工重复插入全量等待。TileLang 的 pipeline 注册、布局/scale 同步与 Cython launch ABI 变化后，重新核对实际调用的 pipeline、生成代码和 stream/参数绑定；同名 kernel 或 Python 包版本不足以复用旧缓存。DCC 的 memory scope 使用当前头文件宏，不能把旧枚举数值固化到新版本；AICC、DCC 与其实际选择的 LLVM/GCVM 后端分别记录。
+Triton/TileLang 的前端选项、流水 pass 和后端工具链须作为同一组合核对。BufferLds copy 转换、数据发布和槽位复用可能由不同 pass 负责；不能从某个转换 pass 没有 wait 推断同步缺失，也不能手工重复插入全量等待。当前 HCU Triton `f8cbbee1849806f96337e85685e1ba031b63f096` 的 [pipeline](https://github.com/HYGON-AI/triton-das/blob/f8cbbee1849806f96337e85685e1ba031b63f096/third_party/hcu/backend/compiler.py) 在转换后无条件同步 buffer-LDS copies，再按需做 block-pingpong 调度；旧的具体 pass 顺序不能套用。LLVM pin、Clang 版本与显式寄存器请求也属于缓存身份，区域/launch 请求冲突须解决，不能让自动估算掩盖。TileLang 的 pipeline 注册、布局/scale 同步与 Cython launch ABI 变化后，重新核对实际调用的 pipeline、生成代码和 stream/参数绑定；ordinary LDS 的 `ds_read_vector` 与 MLS 格式不同，Alt2 的 dtype、warp 分解和消费者映射须配套，不能作为通用转置开关。同名 kernel 或 Python 包版本不足以复用旧缓存。DCC 的 memory scope 使用当前头文件宏，不能把旧枚举数值固化到新版本；AICC、DCC 与其实际选择的 LLVM/GCVM 后端分别记录。
 
 同一 grouped GEMM 名称也可能对应不兼容的物理协议。DeepGEMM 的内部通用、公开通用及 MegaMoE 专项分别查证；pair32、W6、N32、pack5 和各自 scale 不能互换，升级后从保留的原权重重新准备。签名中的 config/overlap/signal 可能未被传到底层，也可能在新版才开始生效；核对 native 调用、输出有效前缀、返回 tensor 或完成阈值，再接消费者。LightOP 公开版的分类 API、资源装包和根 `csrc` 与内部旧树不同，不能沿旧 `op_core_miopen` 规则定位当前公开包。开放 PR 继续作为候选，源码/制品/设备验收分别记录。
 
@@ -33,7 +33,7 @@ Triton/TileLang 的前端选项、流水 pass 和后端工具链须作为同一�
 
 ## 2. HCU 分支与能力边界的检索入口
 
-下表于 **2026-11-04 对照 HCU-Knowledge `c08470f7c1032f8ad9f072a161c687d2a6b50a3b` 的工程报告和固定源码**核对，提供仓库身份和分支选择起点，不固定未来任务依赖，也不宣称本轮编译验证。实际操作先用 `$hcu-knowledge-search` 查工程报告和来源决策，再确认现场版本与当前源码；同用途公开 HYGON 仓实质同步时优先公开，内部领先则用内部适用分支。DTK `:20080` 与 DAS `:10068` 是两个权限域。
+下表的初始查证基点为 2026-11-04 的 HCU-Knowledge `c08470f7c1032f8ad9f072a161c687d2a6b50a3b`；**2026-11-18 又对照已发布 `a3a5be59183d564e54897e8a653604be8c91d505` 的变更和固定证据修订受影响入口**。它提供仓库身份和分支选择起点，不固定未来任务依赖，也不宣称本轮编译验证。实际操作先用 `$hcu-knowledge-search` 查工程报告和来源决策，再确认现场版本与当前源码；同用途公开 HYGON 仓实质同步时优先公开，内部领先则用内部适用分支。DTK `:20080` 与 DAS `:10068` 是两个权限域。
 
 | HCU 工程 / 源码入口 | 已登记分支与修改归属 |
 | --- | --- |
@@ -44,13 +44,13 @@ Triton/TileLang 的前端选项、流水 pass 和后端工具链须作为同一�
 | [AITER](http://42.228.13.241:10068/dcutoolkit/deeplearing/aiter) | 内部 `main` 为当前 HCU 综合入口；通信、量化与融合分别核对 Python/native、组状态和消费者，不用 AMD 同名接口替代 |
 | [Primus Turbo](http://42.228.13.241:10068/dcutoolkit/deeplearing/Primus-Turbo) | `wyf-main` 为综合 HCU 线，`perf/hygon-megamoe-asm-final` 是专项；自有算子/backend 归这里，并核对 Primus patch、CK/hipBLASLt/AICC 依赖 |
 | [rocSHMEM](https://github.com/HYGON-AI/rocSHMEM-das) | `develop`；设备侧单边通信、heap、provider/SHCA 与内存可见性。消费者实际 gitlink 优先于该分支 HEAD |
-| [DeepEP](http://42.228.13.241:10068/dcutoolkit/deeplearing/DeepEP) | 当前源码主用 `develop`；普通构建材料的 `ci-release` 与实际部署版本另核对。[公开仓](https://github.com/HYGON-AI/DeepEP-das)及旧专项不直接替代当前内部能力 |
+| [DeepEP](http://42.228.13.241:10068/dcutoolkit/deeplearing/DeepEP) | 当前大库选定内部 `main@1be01550`；`develop`、普通构建材料的 `ci-release` 与实际部署版本分别核对。[公开仓](https://github.com/HYGON-AI/DeepEP-das)及旧专项不直接替代当前内部能力；cached scatter、路由截断与权重梯度见[通信契约](communication-optimization.md#11-数值协议与后端策略必须一起核对) |
 | [UCCL](http://42.228.13.241:10068/dcutoolkit/deeplearing/uccl) | `main`；分别确认 `collective/`、`p2p/`、`ep/`。不能把整个仓当单一 RCCL 替换库 |
 | [UltraEP 内部](http://42.228.13.241:10068/dcutoolkit/deeplearing/ultraep) / [公开](https://github.com/HYGON-AI/UltraEP-das) | 当前内部 `develop` 有公开 `main` 未含的 HIP placement 保护、MLX5 构建及父锁变化；按实际功能选择，不能继续视作只有许可/CI差异 |
 | [MoonEP](http://42.228.13.241:10068/dcutoolkit/deeplearing/MoonEP) | `develop`，`master` 仅历史初始化；按实际版本检查 dispatch/combine、G1、同步和单/多节点支持 |
 | [MORI](http://42.228.13.241:10068/dcutoolkit/deeplearing/mori) | `dcu-mori-ep-internodev1ll`；MORI EP、MORI-SHMEM 和独立 morishmem 源不能互相代替 |
 | [rocBLAS](http://42.228.13.241:20080/dcutoolkit/mathlibs/rocblas) / [hipBLASLt](http://42.228.13.241:20080/dcutoolkit/mathlibs/hipblaslt) | 前者 `dtk-26.10.1`，后者 `chitu-develop-bw-nmz` 与对应发版线；先分析真实 bench 命令和 tune 需求，再决定算法/dispatch 修复 |
-| [MIOpen](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen) | `develop` 综合线，当前观察 `c8f09a6b704e`；卷积及其他算子的 solver/选优/融合归此仓。新增 handle tuning policy 与 cached solution 的消费者、环境模式和缓存资格按[数学库指南](math-library-tuning.md)联查 |
+| [MIOpen](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen) | `develop` 综合线，当前观察 `592d0c39b4d5`；卷积及其他算子的 solver/选优/融合归此仓。公开 FindMode、handle tuning policy、cached solution 与 workspace 范围的不同契约按[数学库指南](math-library-tuning.md)联查 |
 | [DeepGEMM 内部](http://42.228.13.241:10068/dcutoolkit/deeplearing/deepgemm) / [公开](https://github.com/HYGON-AI/deepgemm-das) | 内部 `develop` 当前实质领先；公开 `develop` 与 yuguo-Jack `supernode` 专项独立，不按相同包名混用布局、完成信号或测试证据 |
 | [LightOP](https://github.com/HYGON-AI/lightop) | 公开 `master` 为主入口，内部 `lightop-dev` 另有维护范围；按分类 API、实际扩展与运行资源核对，旧目录和公开 open PR 不作为当前安装合同 |
 | [DCC](http://42.228.13.241:20080/dcutoolkit/driverruntime/llvm-project) / [AICC](http://42.228.13.241:10068/dcutoolkit/deeplearing/aicc/llvm-project) | DCC `develop-6.0.0` 是 DTK HIP 编译器体系；AICC `dtk-llvm-6.3.3` / `dtk-llvm-7.2.1` 是独立 AI 编译器，不因同名 llvm-project 混用 |
@@ -60,7 +60,7 @@ CK、Flux、PyTorch/Inductor 等未在表中逐一列出的真实依赖也可按
 
 分别记录父仓 gitlink、构建脚本显式 checkout、最终加载的依赖制品；三者可能不同。当前 DeepEP 构建脚本会选择特定 rocSHMEM 子提交与 SHCA/provider，独立 rocSHMEM develop 的新策略不自动进入该消费者。AITER 锁定的 CK/MoE 也不能由独立子仓 HEAD 替换；新增 selector、模板参数或量化布局要追到父仓实际采用的版本。显式环境开关仍需检查实际读取与分派，保留兼容名字但已 ignored 的变量不能证明命中，master 关闭也可能改选另一 provider。
 
-本次固定比较中，DeepEP `a755fa7e14631af7e8a6a0d6ead217101d3bfdda` 的 `build.sh` 显式选择 rocSHMEM `b71ac40294bb10c5ffb11b94bed7d7d20529ab02`；UltraEP 内部 `a2a835e4e91653d245f36281e4ffcc120ffdff75` 的父锁为 `f56dda42070f42e9958334bb98b8217e7e09d070`，公开旧父锁不同。多 provider 合包仍须在初始化后确认实际选择及 RDMA atomic 能力；切 provider 的构建 ABI、扩展和运行时配置成套更换，不能只改环境变量。上述是来源与消费者的固定证据，不是当前训练环境已升级的记录。
+历史固定比较中，DeepEP `a755fa7e14631af7e8a6a0d6ead217101d3bfdda` 的 `build.sh` 显式选择 rocSHMEM `b71ac40294bb10c5ffb11b94bed7d7d20529ab02`；UltraEP 内部 `a2a835e4e91653d245f36281e4ffcc120ffdff75` 的父锁为 `f56dda42070f42e9958334bb98b8217e7e09d070`，公开旧父锁不同。这些 pin 仅解释对应旧版本，当前父锁须从所选提交重新读取。多 provider 合包仍须在初始化后确认实际选择及 RDMA atomic 能力；切 provider 的构建 ABI、扩展和运行时配置成套更换，不能只改环境变量。上述是来源与消费者的固定证据，不是当前训练环境已升级的记录。
 
 统一知识入口为 HCU-Knowledge `knowledge/projects/<project>/knowledgebase/local/overview/engineering-guide.md`；搜索结果提供固定源码、PR/MR 与原件。这里仅登记引用与归属，内部实现仍在其受控来源，不复制到公开 Wiki。库调用、架构/ABI、provider、精度与完成语义必须与本次任务相符。
 
@@ -69,6 +69,8 @@ CK、Flux、PyTorch/Inductor 等未在表中逐一列出的真实依赖也可按
 接入 Primus Turbo 等自定义 autograd 时，追到原 Parameter 的属性、每次 backward 的写入和 DDP hook。当前 `06354e0a5aedeac45c5d67fe9ab84cc86cb4ab25` 的 MegaMoE FP32 路径既可产生独立 dW 后加到 `main_grad`，也可由已准入 native 路径直接写当前 sink；`_finish_wgrad` 核对同一存储后跳过第二次 add，再设置 `grad_added_to_main_grad` 并返回匹配 dummy。`main_grad` 须与权重同 shape/同设备、FP32 且不需梯度；直写另需 contiguous、policy 对齐和形状资格，不满足时保留独立 dW 路径。该标志不能被解释成整次迭代只累加一次。覆盖非零初始梯度、多 microbatch、重复 backward、iteration reset 和 zero-out，证明每次 backward 恰好累计一次；hook、optimizer 和 checkpoint 消费前仍须确认写入完成。不能把某个模型/profile 的资格推广到其他路径。编译或 autotune 可能实际执行带副作用的 kernel，冷/热缓存都要验证，避免首轮额外更新。
 
 prepared Graph 还须按目标库的公开 workspace 协议准备和释放；普通 eager 中的 host 容量计划不会因存在 Graph API 就消失。当前 Primus Turbo 的受限 prepared 路径要求相同 rank 配置、稳定地址和 source owner，raw whole-step replay 不会重新执行 host DDP hook，须用对应 replay 入口恢复标记。保留源、重入、partial/backward-only capture、main_grad sink 与独立 wgrad stream 分别验收，关闭前确认所有消费者结束。CK 直接实例的完整 CU 要求与通信预留 CU 不能未经核验叠加；不满足时回到已支持 provider。
+
+eager 延迟 source read 与 prepared Graph 分开检查。Primus Turbo `d661bb371b86253d98ed9e1d4bd3613f8c4b9272` 的 [SourceReadFence](http://42.228.13.241:10068/dcutoolkit/deeplearing/Primus-Turbo/-/blob/d661bb371b86253d98ed9e1d4bd3613f8c4b9272/primus_turbo/pytorch/hygon/megamoe_read_fence.py) 只服务 execution profile 准入的 eager Deferred 路线；capture/Graph 仍用 Inline。native enqueue 后立即 commit ticket，保留 IPC 原分配、Tensor 与 planner 状态，直到真正复用 source/state 时在当前 stream join completion；显式回收或切换 owner/模式前先 drain。Python 返回、Tensor 仍在或 allocator 的 stream 跟踪都不能单独证明 raw IPC 可释放。准备失败时尚可走未省略 tail 的原路线；已发起 side barrier 后失败含糊时 poison 并保留 lease，不能补第二个 barrier 或重跑写入。native 错误只有 CPU `unwind_status==1` 证明安全 tail 已建立，取消路径仍须同步 origin stream 后才释放 ticket，并清零已消费信号；无证明则保留资源、停止该 workspace 复用并交诊断。队列上限与最旧项等待也计入稳态成本。上述是固定源码及测试设计审阅，未在此执行上游或设备验收。
 
 TE 的开发 main 与 HCU release 分开查证。按实际 recipe 保留持久 scale/amax 历史，stateless recipe 的空 extra state 与 DelayedScaling 恢复不是同一协议；旧 checkpoint 默认被拒绝时核对格式与来源，不能用丢弃历史或全局启用 unsafe pickle 兼容开关消除报错。Userbuffers、预分配 out/dgrad_out、权重量化缓存重建后，检查 alias、地址寿命和编译常量失效；当前 main 的 `destroy_ub()` 会重置编译缓存，旧编译图不应被当作新 UB 配置的验证。
 

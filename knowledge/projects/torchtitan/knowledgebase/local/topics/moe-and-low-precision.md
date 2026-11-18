@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/models/common/dist_moe/README.md
@@ -62,6 +62,30 @@ sources:
   path: tests/rl/unit_tests/cpu/test_model_defaults.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 44bf357ff2ddfa185feca23384b2152168c25c0727dcc253f14616e36c6e2427
+- source: pytorch-torchtitan
+  path: torchtitan_recipes/rl/model_configs.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: fe0da78525a977441c3d762b4cbfef36485de6b9c206dd593e11cd9c3e55ff00
+- source: pytorch-torchtitan
+  path: torchtitan/config/transform/disable_moe_load_balancing.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 6cc86786d375364ed32b0f894f35649a017e782f41fa81582516c08bb772904e
+- source: pytorch-torchtitan
+  path: tests/rl/unit_tests/cpu/test_model_defaults.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 3a7e87bc9f400f044ebdca7ead6807f672c8d2cc60424b47ebfc8df2611a157a
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/linear/linear.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: feda76239d93cb5b90422663b188cf228c124f7716dac99accefe24a64f64db3
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/moe/moe.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: afe2a5c4474327070b8349980caef08cdf78904e316053104d3ddb38d3ad92ad
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/moe/token_dispatcher.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 042d3071b9984353104d9300abba80cadfdc231c14909f7ee481d82ab1cef218
 pr_sources:
 - pr-pytorch--torchtitan-5263
 - pr-pytorch--torchtitan-5250
@@ -110,17 +134,17 @@ NVFP4 依赖 TorchAO prototype 与 Blackwell/CUDA；当前说明要求切分后�
 
 HybridEP 的 `non_blocking_capacity_factor=None` 是有host同步的精确容量、不丢token路线；1.0按当前最坏容量分配，较小正值会使超出permute容量的token被丢弃，GPU overflow_flag可置位。该factor不调整独立预分配的A2A通信buffer。使用非阻塞以满足捕获限制时，必须观测overflow并验证质量，不能因不再发生CPU等待就宣称等价。
 
-RL的 `build_rl_model_configs` 新默认同时作用于trainer和generator：FP32-output LM head，以及冻结MoE router gate、expert bias和移除load-balancing aux loss。`freeze_moe_routing=False` 才保留原router训练；freeze不保证hidden states变化后专家选择不变。此处是RL配方的训练语义，不能传播为预训练的默认或用来掩盖数值不一致；SoftCappedLinear等配方保留明确例外。
+RL 的 `build_rl_model_configs` 默认同时作用于 trainer/generator：FP32-output LM head、冻结 expert bias 并移除 load-balancing aux loss；router gate 继续训练。`disable_moe_load_balancing=False` 保留原 load-balancing 配置，旧 freeze_moe_routing 接口已删除。此处是RL配方的训练语义，不能传播为预训练的默认或用来掩盖数值不一致；SoftCappedLinear等配方保留明确例外。
 
 ## Dispatcher 输入与重算消费者的迁移
 
 当前 dispatcher 接收 bool `routing_map_TE(T,E)`；local/A2A 路径在内部求专家 token counts，DeepEP/HybridEP 则使用各自返回的全局路由量。EP process group 从当前 sparse SPMD mesh 获取，不再依赖旧实例 `ep_mesh`。不能把旧计数 tensor 作为同位置实参传入新接口。
 
-DeepEP/HybridEP 的 dispatch 与 combine 共用 `ep_communication` remat policy，forward handle 与 backward 相配；DeepEP 依赖确定性排序 buffer，HybridEP 依赖保持顺序的 prefix scans。保存/重放选择影响通信次数与生命周期，需连同量化 padding、score dtype、gradients 和专家顺序验证。Dist-MoE 仍要求根 `precision.param_dtype="bfloat16"`；源码中的 backend/硬件限制不会因字段迁移而消失。
+HybridEP 的 dispatch/combine 仍按其 `ep_communication` policy 与 forward handle 配对；DeepEP 当前只有 dispatch 按该策略重放，combine 强制保留，不再一起重放。DeepEP replay 需要确定性排序，HybridEP 依赖 prefix scans 顺序。保存/重放影响通信次数与生命周期，连同 score、padding、梯度与专家顺序验收；Dist-MoE 的 dtype/硬件门禁另行保留。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/models/common/dist_moe/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/dist_moe/README.md)
 - [torchtitan/config/transform/dist_moe.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/transform/dist_moe.py)
@@ -149,3 +173,16 @@ DeepEP/HybridEP 的 dispatch 与 combine 共用 `ep_communication` remat policy�
 - [torchtitan/models/common/moe/token_dispatcher.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/moe/token_dispatcher.py)
 - [torchtitan/config/transform/freeze_moe_routing.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/transform/freeze_moe_routing.py)
 - [tests/rl/unit_tests/cpu/test_model_defaults.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/rl/unit_tests/cpu/test_model_defaults.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+RL 模型默认改为 `disable_moe_load_balancing=True` / `DisableMoELoadBalancingTransform`：冻结 expert bias、去 router aux loss，**router gate 继续训练**。旧 `freeze_moe_routing` 参数与 transform 删除。显式 False 保留原 load balancing 配置，两角色仍要一起核对参数组、目标和 logprob；这不改变监督训练配方的默认。
+
+DeepEP 新 `DeepEPDispatchMetadata.scores_R` 单独携带每展开行的 routing score。没有 output postprocess 时，线性 W2 通过 `GroupedLinear(..., scores_R=...)` 在输入端计算 FP32 乘积后转回输入 dtype，减少大输出的保存；有非线性 postprocess 时必须先执行它，再乘 score，不能交换次序。移动乘法/舍入点需要对照前后向与训练更新，不仅比较浮点公式。
+
+DeepEP 的 dispatch replay 仍由 `ep_communication` 策略控制并要求确定性排序，但 combine 现在作为 `recompute=False` 的纯归约整体保留，只需相应路由索引，**不再与 dispatch 一起重放**。HybridEP 的 non-blocking capacity rows 中未写区域要在 postprocess 前后用 where mask，阻止垃圾 NaN 和额外梯度；不能用乘零替代。batch-invariant 的共享/路由分支还分开 TP 归约后相加，可能额外增加 collective。新本地 permutation backward 采用 inverse gather，依赖索引确为一一置换，不能推广到含重复 index 的 scatter-add。
+
+固定入口：[torchtitan_recipes/rl/model_configs.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan_recipes/rl/model_configs.py)；[torchtitan/config/transform/disable_moe_load_balancing.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/config/transform/disable_moe_load_balancing.py)；[tests/rl/unit_tests/cpu/test_model_defaults.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/tests/rl/unit_tests/cpu/test_model_defaults.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: docs/user-guide/features/moe.md
@@ -77,10 +78,51 @@ sources:
   path: megatron/core/distributed/finalize_model_grads.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: 6dac52af3f531447c4dfd96bca03b0607cb0fe509c5108890e90812c3bdf190a
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/moe/moe_layer.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: a0841a62332c6b6f0c3345304fa2a946b58074617f2390ac39430f4002956657
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/moe/router.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: e76de8533c6a4d73a29212dd6dabe48f04174c1bd3451fa31df6979c79a38a60
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/moe/token_dispatcher.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: c00e9e4acd88ee98a34d0e7bcb1fbe8a402b2361deda7f187e591aab2eff435d
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/transformer_config.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 5470c5ca64aad696089ba9503f588c89d33669df05682d51e0d01bda705ca16e
+- source: nvidia-megatron-lm
+  path: megatron/core/models/gpt/gpt_layer_specs.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 243c3f4d670c3521386660ba7dd8148e56803574e8e8c1017282aedcadaf66f8
+- source: nvidia-megatron-lm
+  path: tests/unit_tests/transformer/moe/test_virtual_experts.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 45afc9a1e3431af146e364d27084308ffaa54edaa8f4ed6db9dd5f26f9e35897
 retrieved_on: '2026-11-04'
 ---
 
 # Megatron MoE：路由、dispatcher、grouped GEMM与容量控制
+
+## 2026-11-18：当前路由调用与不变量
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+当前 MoELayer 的 route/forward 可接收当前调用的 `replay_topk_idx`，经 RouterReplay context 传给路由；TE partial-capture 的 mixin 与专用 signal 已独立，不能继续沿旧通用 CUDA-graph helper 名称判断 capture 范围。虚拟专家 shared-expert 的时序、实际 dispatcher 和原有 Paged Stash 互斥仍需按同一配置核验，旧 copy/pop 案例不代表所有新组合通过。
+
+router 将 deterministic 请求传入 aux-loss 路径，并对 quantile balancing/重跑路径限制 batch-invariant sigmoid top-k 的使用；“存在 fused API”不证明它满足所需确定性。另有显式 `moe_ep_invariant_combine` 门槛：需 batch_invariant_mode、有效 EP/expert 数，并限制 inference grouped-GEMM backend；不能把局部相同输出推成任意 EP/后端 bitwise 一致。GPT layer spec 的 grouped-GEMM 默认值也有推进，采用时记录最终 spec/consumer而非照搬旧默认。当前未执行多 rank 或 HCU 数值测试。
+
+### 本节固定证据
+
+- [megatron/core/transformer/moe/moe_layer.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/moe/moe_layer.py)
+- [megatron/core/transformer/moe/router.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/moe/router.py)
+- [megatron/core/transformer/moe/token_dispatcher.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/moe/token_dispatcher.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/transformer_config.py)
+- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/models/gpt/gpt_layer_specs.py)
+- [tests/unit_tests/transformer/moe/test_virtual_experts.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/tests/unit_tests/transformer/moe/test_virtual_experts.py)
 
 ## 从路由到梯度的工作负载
 

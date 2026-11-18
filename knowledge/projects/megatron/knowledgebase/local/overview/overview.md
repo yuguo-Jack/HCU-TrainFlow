@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: README.md
@@ -45,10 +46,41 @@ sources:
   path: megatron/training/datasets/providers.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: a28174f91d974d5ac17d577ed53da2a71af8df16988edca006cc4ccac2c10938
+- source: nvidia-megatron-lm
+  path: pretrain_gpt.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 1ba21dabb7284799ec1e7b2e37475e4037f8940452d6d40615d5eeba049c9a40
+- source: nvidia-megatron-lm
+  path: megatron/training/training.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: c6fc98b09a21b609b2623eacbb224b8b9c168c840e922dca963ad4b0910e7237
+- source: nvidia-megatron-lm
+  path: megatron/training/config/container.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 6fee251020eb4fa1087ea88bdd022b250e2a276910c3f217de8eb49129efd323
+- source: nvidia-megatron-lm
+  path: megatron/core/parallel_state.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 72b099752dd73135d3608947593a56539249cb20e43e5359fa4b5a5621db7e62
 retrieved_on: '2026-11-04'
 ---
 
 # Megatron 官方生态：职责、完整阅读路线与版本边界
+
+## 2026-11-18：当前开发树的使用边界
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+当前阅读固定到官方 `91260b59e815f0be44d625d75ba22cb8473e5981`，不是 HCU 部署锁。训练入口继续同时保留兼容 args 与注册 run config，实际模型/数据、保存恢复和 optimizer 的消费者应按 owning section 追踪；参数已解析不等于当前模型已采用。并行实现新增动态 CP 和显式 process-group 迁移，不能再把同一个全局 MPU grid 视为所有模型或每个 packed microbatch 的所属组。
+
+升级前重点进入[并行](../topics/parallelism.md)核对动态 group 与不支持组合、[训练与 loss](../topics/training-and-loss.md)核对 MTP 的 token 分母和日志口径、[保存恢复](../topics/checkpoint.md)核对持久 worker/保存策略与状态来源。旧固定机制、实验数字和 HCU 适用性仍保留各自版本，不能以本次官方源码存在证明现场已支持。
+
+### 本节固定证据
+
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/pretrain_gpt.py)
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/training.py)
+- [megatron/training/config/container.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/config/container.py)
+- [megatron/core/parallel_state.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/parallel_state.py)
 
 ## 工程组成与训练职责
 

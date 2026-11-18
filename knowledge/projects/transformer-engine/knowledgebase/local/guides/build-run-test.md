@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
@@ -60,6 +60,26 @@ sources:
   path: transformer_engine/pytorch/ops/basic/grouped_linear.py
   commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: d8a8dacdc5c192408a93258968e96dbd178a208b5e9c95ffcc44e5f3ed9e2823
+- source: nvidia-transformerengine
+  path: docs/installation.rst
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 86372814c4a1f14ef7be6bbbfd20c707ccd63a0e0bd707cce645b4bf4263fa0e
+- source: nvidia-transformerengine
+  path: docs/envvars.rst
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: cc8514ad8c952a78b6a116b4f470dfeb34c035204f98e0d9cce3f9df6b4a8857
+- source: nvidia-transformerengine
+  path: tests/pytorch/attention/test_attention_backend_selection.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 45bdbad3fcf424a0344cdf926cddfda0a8908530e482f72c38e26198b406d56f
+- source: nvidia-transformerengine-docs
+  path: environment-variables
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: 48987109228001ee0c9a3c7bfbf44764a3913476a58b5b3eb24add35f140acf6
+- source: nvidia-transformerengine-docs
+  path: installation
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: b7e910d5d655fb7af9f95d848f5314d6e93a4adec822665d6f503de9ee85ed17
 ---
 
 # TE 安装、运行、单测与 HCU 环境接入
@@ -69,6 +89,14 @@ sources:
 官方安装教程面向 NVIDIA：CUDA、驱动、cuDNN、框架扩展需匹配。训练工作流不要为了查 Wiki 在本地主控安装 CUDA/TE，也不要用 NVIDIA wheel 覆盖 HCU 环境已有的 TE。先查实际模型环境中 TE 来自镜像、wheel 还是源码编译，并核对模块路径及动态库解析。
 
 官方源码参考安装步骤为：选择具体 tag/commit，按该提交初始化所需 submodule，再按 `docs/installation.rst` 构建；PyTorch 路径的示例安装形式为 `python -m pip install --no-build-isolation '.[pytorch]'`。它需要已经满足构建依赖的 NVIDIA 环境。HCU 运行使用 HCU 工程对应脚本，保留其 DTK、编译器、通信库和框架配置。
+
+## 当前官方依赖与分发诊断
+
+固定 `8e89d3ad8b2c` 的安装文档要求 cuDNN Frontend≥1.31.0、PyTorch≥2.8，JAX 路线≥0.5.3；它们是该 NVIDIA 版本的条件，HCU 仍按自身分支、镜像和 ABI 核对，不自动替换已有训练依赖。
+
+CuTeDSL 路线要求构建时启用且满足 `apache-tvm-ffi`、`nvidia-cutlass-dsl>=4.8.0` 与 Python 条件。旧 `NVTE_WARN_IF_CUTEDSL_BACKEND_NOT_CHOSEN` 已由 `NVTE_REPORT_IF_CUTEDSL_BACKEND_NOT_CHOSEN=WARN|ERROR` 取代，只在启用 CuTeDSL 时生效：WARN 保留说明后回退，ERROR 拒绝该回退。诊断变量不能证明已实际命中目标 kernel，也不能直接作为 HCU 环境变量清单。
+
+官网2.21.0的环境变量页仍展示旧 `NVTE_WARN_IF_CUTEDSL_BACKEND_NOT_CHOSEN`，而所选 main `8e89d3ad8b2c` 已采用上述 REPORT 变量；官网安装页与主干的新依赖下限也分别记录。按实际安装版本选择说明，不能混用网页发行版本和开发树的开关。
 
 ## 安装证据清单
 

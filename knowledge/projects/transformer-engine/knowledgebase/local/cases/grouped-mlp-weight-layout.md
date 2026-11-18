@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tests-reviewed
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
@@ -20,6 +20,14 @@ sources:
   path: tests/pytorch/test_grouped_mlp.py
   commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: fd23ca189afa3771c15706d8b5f52cf01955b2c0c9dadc945938afe5ab75577f
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/ops/fused/grouped_mlp.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 244df5eb49c4c1d4d87e91e677c1b2971dbe73fe4633ba658aa60d5f40b87f7d
+- source: nvidia-transformerengine
+  path: tests/pytorch/test_grouped_mlp.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 3881862a0b4f56f0a74dc9a5d1ed7ffaa4839ff8772623e77eac90f01af9ccc0
 pr_sources:
 - pr-nvidia--transformerengine-3662
 ---
@@ -32,11 +40,13 @@ pr_sources:
 
 ## 前后向调用链
 
-在 `grouped_mlp.py` 的 `fuser_forward`，FC1 的 scale 视图使用实际 `fc1_weight_k` 而非直接套原 weight shape 的第二维。`fuser_backward` 中 FC2 dactivation 使用 columnwise 权重；NVFP4 的这份数据已经物理转置，不能再沿 MXFP8 的 reshape/permute 路线解释。
+在 PR #3662 对应的历史 `grouped_mlp.py` 的 `fuser_forward`，FC1 的 scale 视图使用实际 `fc1_weight_k` 而非直接套原 weight shape 的第二维。`fuser_backward` 中 FC2 dactivation 使用 columnwise 权重；NVFP4 的这份数据已经物理转置，不能再沿 MXFP8 的 reshape/permute 路线解释。
 
-新 NVFP4 路径调用 `_convert_to_cudnn_grouped_gemm_tensor_format`，显式传入 logical K、有效 M/N、数据/scale dtype 与 `sf_swizzled=True`。MXFP8 分支保留自己的数据和 scale permutation。消费者最终是 cuDNN grouped GEMM 融合入口，必须同时核对这两个工程的格式契约。
+该历史 NVFP4 路径调用 `_convert_to_cudnn_grouped_gemm_tensor_format`，显式传入 logical K、有效 M/N、数据/scale dtype 与 `sf_swizzled=True`。MXFP8 分支保留自己的数据和 scale permutation。消费者最终是 cuDNN grouped GEMM 融合入口，必须同时核对这两个工程的格式契约。
 
-当前 `720b25258be3` 为支持 `supports_canonical_layouts` 的 wrapper 增加 MXFP8 自然布局路线，兼容旧 wrapper 时才保留对应 kernel-facing view；NVFP4 的 packed data/scale 与单 group 物理转置合同没有因此消失。fwd、dGLU 与 wgrad 的能力探测各有作用域，不应只检测一个 wrapper 就改写全部反向布局。新增 BF16 融合另有准入，见[融合专题](../topics/fusion-and-profiling.md)。
+历史固定 `720b25258be3` 为支持 `supports_canonical_layouts` 的 wrapper 增加 MXFP8 自然布局路线，兼容旧 wrapper 时才保留对应 kernel-facing view；NVFP4 的 packed data/scale 与单 group 物理转置合同没有因此消失。fwd、dGLU 与 wgrad 的能力探测各有作用域，不应只检测一个 wrapper 就改写全部反向布局。新增 BF16 融合另有准入，见[融合专题](../topics/fusion-and-profiling.md)。
+
+当前 `8e89d3ad8b2c` 已移除上述旧转换 helper，block-scaled 路线最低依赖 cuDNN Frontend1.31.0，并按实际 wrapper 能力选择 canonical layout、runtime offsets 与单 group 路径。案例仍用于解释 logical K、packed data/scale 及反向物理转置的不同，不能再照旧 helper 名调用当前实现。BF16 的1.32.0及能力 flag 是另一条准入路线，不替代 NVFP4/MXFP8 的格式验证。
 
 ## 为什么会影响优化判断
 

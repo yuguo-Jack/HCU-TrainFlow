@@ -10,8 +10,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: fixed delta and actual rollout/training/recovery consumer review; no HCU runtime validation
 sources:
 - source: inclusionai-areal
   path: areal/trainer/ppo/actor.py
@@ -109,8 +109,41 @@ sources:
   path: tests/test_policy_version_mask.py
   commit: 27879753c7611fee9a0af6e71a4f838db27b72a7
   sha256: a890db3f40d94ed6c89c2df32444342013900b77bdcfa248186a6765651c9924
+- source: inclusionai-areal
+  path: areal/api/cli_args.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 33f21c95db99a9a19d4ce04fe71b8815463ee1f6652e0b1a8669d52e39b190a6
+- source: inclusionai-areal
+  path: areal/trainer/ppo/actor.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: c8b583bf564487382daa0d34c934e1e52afa417bcae3335f597e4b83f465d20f
+- source: inclusionai-areal
+  path: areal/engine/megatron_engine.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 07564619f0844ed02627defcb408afbc162f2d9dd4fb8ed5ce72ca0c4d0d3681
+- source: inclusionai-areal
+  path: areal/engine/fsdp_engine.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 2702eb65b8a930d4cd3a48504f088be69916a9e5f147c839794b82eb8c6f66d5
+- source: inclusionai-areal
+  path: areal/engine/sglang_remote.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: f76c51d7ef0e0be23964ca583552ad552e1c58830b90604b40a6ea373f31bad7
+- source: inclusionai-areal
+  path: areal/api/engine_api.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: e4ddb14fd39c68e5326846d53d69a7ab7ceba2ce9fe9d3ad586d08b13fe12b17
+- source: inclusionai-areal
+  path: areal/infra/workflow_executor.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 3de4bf868c2534bf214292218af80a86b26648a36f9697df49c04f2e9cad4c9c
+- source: inclusionai-areal
+  path: areal/utils/rollout_metrics.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 1ac76b54417286b145db076980628fff8643399b5dde043912cd8cb90388904b
 pr_sources:
 - pr-areal-project--areal-1546
+retrieved_on: '2026-11-18'
 ---
 
 # Loss 聚合、packing 与梯度归一化
@@ -199,9 +232,17 @@ MTP保留input-token provenance的单独mask，由实际model `_postprocess` 获
 
 native SGLang RLVR收集top-K sampler head；width须为1…1024的整数，ids不重复且非负，logp有限非正、head总mass不大于1，已采token在head中时概率须吻合。要求temperature=1、非greedy、top_p=1且不截断top_k、无frequency penalty/beam；OpenAI客户端拒绝此设置。actor要求每条trajectory都带匹配head，并与target shift保持一致。
 
-当前仅普通FSDP actor支持（含受限TP/CP），拒绝tree、critic、recompute_logprob、distillation及SAPO/CISPO/decoupled/M2等组合；TIS只接受token ratio clamp、无lower bound。TP要求等宽词表shard，token rows/ids在TP内复制，SUM的local backward保持identity，checkpoint重算关闭early-stop以维持collective顺序。实现按chunk checkpoint FP32 log-softmax，**完整输入logits仍驻留**，entropy只作无梯度诊断；不能称为消除完整logits的LM-head融合。
+当前 `7fb167a3` 支持普通 FSDP 及受限 Megatron actor：Megatron 走普通 packed logits，sampler head 与 labels 使用相同 CP 切分，correction 随 logp 一起 reassemble/unpad；拒绝 tree、critic、chunked LM head、MTP 和有梯度 entropy。temperature=1、无 recompute_logprob、无 distillation 及 SAPO/CISPO/decoupled/M2 等原门禁保留，不能由 CLI 放开 Megatron 推广全部组合。TP 要等宽词表 shard，head/token 对齐与原 sampler 概率仍必须成立，TIS 只接受受限 token ratio clamp。实现仍保留完整 logits，entropy 仅诊断，不是移除了 LM-head 的激活。现有 FSDP/并行测试不能自动充当新增 Megatron 多 rank 测试，本轮未执行这些上游测试。
 
 `test_score_centering_parallel.py` 比较dense oracle、梯度及Adam更新，TP2/CP2用Gloo而混合TP2×CP2需4卡NCCL；真实模型回归需本地AREAL_TEST_MODEL。本页只阅读，未运行这些上游测试，也没有HCU/NVIDIA通过声明。
+
+## 单 teacher 蒸馏、过滤和多模态的新消费者
+
+本轮单 teacher pure-KD（teacher_logp 存在且 rl_loss_weight=0）先把 detached `log pi_teacher − log pi_current` 作为 advantage，经过与 RL 相同的 clipped policy ratio/rejection 路线，再乘 distill_loss_weight；未启用 rejection 时用 rollout old_logp 作 proximal anchor。旧直接 importance-weighted reward 求和不再是当前公式。联合 KDRL 则从线性 `log pi_current − log pi_teacher` 惩罚改为 `0.5 × log_ratio²` 的 k2 项，按 post-filter numerator mask 和原 denominator 归一，teacher detach。两者都是训练目标/梯度变化，不能称为性能等价更新，MOPD 分支仍单独核对。
+
+`RLTrainer.train(dynamic_filter_kwargs=...)` 将参数沿 should_accept_kwargs 传到实际 rollout worker 绑定 filter，非空 kwargs 需要 filter_fn；远程 controller 仍需可导入的 string path。改变过滤条件会改变接收样本而不自动重定义原 aggregation 分母。stream 观测新增 accepted/rejected/filter_rejected counters，task_attempt 与 task_result 分母也分别导出；它们与 reward 样本数、group 数和最终训练行/token 数不能互换。
+
+FSDP Qwen-VL vision tower 的 pre-hook 移除**文本** packing metadata，避免被 vision helper 当视觉 cu_seqlens/max_length；mRoPE 是否接收 mm_token_type_ids 按实际模型类签名判断。视频使用 pixel_values_videos，SGLang wire 可保留紧凑模板的 video input_ids，但训练 req.input_ids 仍是展开后的 context；partial rollout 必须把已接受输出 suffix 接回正确的展开 prompt 边界。不能 decode/重分词后假定 logp 仍与原 target 对齐。新多模态 item limit 中 None、空映射、单模态0是三种语义，且 dict-config 路线也校验；不由一个放宽门禁推定整套视频训练配方通过。
 
 ## 验证、诊断与回退
 
@@ -221,3 +262,15 @@ native SGLang RLVR收集top-K sampler head；width须为1…1024的整数，ids�
 - [tests/test_named_loss_engines.py](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/tests/test_named_loss_engines.py)
 - [areal/engine/r3/config.py](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/areal/engine/r3/config.py)
 - [areal/engine/r3/transport.py](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/areal/engine/r3/transport.py)
+
+
+## 2026-11-18 固定消费者
+
+- [areal/api/cli_args.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/api/cli_args.py)
+- [areal/trainer/ppo/actor.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/trainer/ppo/actor.py)
+- [areal/engine/megatron_engine.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/engine/megatron_engine.py)
+- [areal/engine/fsdp_engine.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/engine/fsdp_engine.py)
+- [areal/engine/sglang_remote.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/engine/sglang_remote.py)
+- [areal/api/engine_api.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/api/engine_api.py)
+- [areal/infra/workflow_executor.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/infra/workflow_executor.py)
+- [areal/utils/rollout_metrics.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/utils/rollout_metrics.py)

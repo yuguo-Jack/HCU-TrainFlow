@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: modelscope-ms-swift
   path: README.md
@@ -89,6 +90,31 @@ sources:
   path: swift/ray/megatron/base_trainer.py
   commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: a33beaa54b9eb6c1fb47deab437132a3265d7ae27ecd86138854bd62332ecc78
+- source: modelscope-ms-swift
+  path: docs/source_en/GetStarted/SWIFT-installation.md
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: d7f865a3318b63009cf25624e62622f68ad6689cafd840f33b42cd10a0a1d796
+- source: modelscope-ms-swift
+  path: swift/megatron/trainers/base.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: 32df3c9347a88e2f16546d2be16130285a8e089addc9b1256af802d0e8dc75b7
+- source: modelscope-ms-swift
+  path: swift/megatron/trainers/rollout_mixin.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: 05b6cb52913ad0116c20f940e9b221f3345a86212f2d9fe935c1e8c9ebe42b4b
+- source: modelscope-ms-swift
+  path: swift/template/base.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: 4cf23aca75017fd770e5a6ee510fe820ad50f71e182d8aa23fe6f30940ab00b6
+- source: modelscope-ms-swift
+  path: swift/trainers/mixin.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: 9327e9deb5d4b8c9f582f3005cfa2eb89fa377274a4daf4a6f512191716bb1f9
+- source: modelscope-ms-swift
+  path: swift/rlhf_trainers/utils.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: c9b2baac6e9c6c2ee6bf6d2d44120f192fabdc13c52bb3247c96d6a2eadfbbfb
+retrieved_on: '2026-11-18'
 ---
 
 # ms-swift：训练入口、数据契约、Megatron 与 GRPO 工程指南
@@ -197,3 +223,11 @@ Megatron FSDP 的 HF/safetensors 保存现在在需要导出时先对各 chunk �
 
 - [swift/ray/megatron/checkpoint_engine/manager.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/manager.py)
 - [swift/ray/megatron/base_trainer.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/base_trainer.py)
+
+## 当前 LoRA、rollout 与模板消费契约
+
+固定 `cf627bdd5d7e739a6cefc5829ab5696575615e8b` 中，Megatron trainer 的 merge/unmerge 判断由单一 `LoraParallelLinear` 改为 PEFT `LoraLayer`，覆盖范围不再限于旧 bridge 类型。每个实际 adapter 类型仍需核对基权重、active adapter、导出及异常后状态；不能凭类检查扩展就认为所有 tuner 已兼容。
+
+外部 vLLM server 初始化增加训练模板与服务端截断配置的漂移检查；`check_rollout_truncation_config` 只发 warning，旧服务端不返回 `max_length`/`truncation_strategy` 时直接跳过。无报错不证明训练重编码与生成 prefill 使用同一 prompt，须保存两端长度/截断及多模态 processor 配置。
+
+模板对 tool 后连续 user follow-up 保持 query/assistant 配对，并用已渲染标记避免再次展开字面 `{{QUERY}}`/`{{RESPONSE}}`。`use_chat_template=False` 时该组合会拒绝。新增 CUDA Swift4.6 镜像是上游配套入口，`qwen4_exp` full-tuner 保存前另有模型专用 state 恢复调用；这些不自动改变 HCU 镜像、数据目标或部署依赖。

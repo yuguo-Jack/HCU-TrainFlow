@@ -6,9 +6,15 @@
 
 工程用途与联动范围见[第三方工程说明](../THIRD_PARTY_NOTICES.md)，依赖获取方式见[第三方安装说明](README.md)。只登记链接或调用外部工程，不因此重复收录其 Wiki 或复制整套许可证。
 
-## 1. 来源快照与核对状态
+## 当前核对：2026-11-18
 
-**最近核对：2026-11-04。** 本次对照本轮 22 个 Git 来源的固定完整树、[来源登记](../knowledge/sources.json)及工具依赖锁；其中 21 个仓保留许可副本，BBuf 未登记根目录许可，不据公开访问推断额外授权。这不是对观测后继续推进的上游 HEAD 的检查。
+本次对照 24 个登记来源的实际采集版本，29 份既有仓库/文档专用许可副本中 25 份字节不变、4 份有变化，逐项固定 URL、旧/新 SHA 与历史副本见[许可复核收据](../knowledge/catalog/license-review-20261118.json)。MindSpeed 与 MindSpeed-LLM 当前根 LICENSE 已改变为 Apache-2.0 文本，相关源码版权头也有调整；旧混合声明精确副本继续保留，不能用当前根声明重写旧材料归属。cuDNN Frontend 新增 decode-row SwiGLU、FP8 projection 所用 CUTLASS/FlashInfer 来源链及第三方声明，当前完整副本与旧副本分别保留。
+
+Hyperloom 后续来源切换为官方 `AMD-AGI/Hyperloom`，旧 fork 记录保留历史身份和稳定 source ID；同样字节的许可按新官方固定版本核对。只读工具依赖 TraceLens 仍锁原版本，未自动升级。以下 2026-11-04 表格为历史检查范围；官网声明与文件专用条款仍按实际材料核对，不能把代码仓许可副本比较扩大为全部网页再分发授权。
+
+## 1. 历史来源快照与核对状态
+
+**历史核对：2026-11-04。** 本次对照本轮 22 个 Git 来源的固定完整树、[来源登记](../knowledge/sources.json)及工具依赖锁；其中 21 个仓保留许可副本，BBuf 未登记根目录许可，不据公开访问推断额外授权。这不是对观测后继续推进的上游 HEAD 的检查。
 
 | 范围 | 核对结果与边界 |
 | --- | --- |
@@ -25,9 +31,9 @@
 
 - [AMD-AGI/Primus / LICENSE](licenses/amd-agi-primus/LICENSE) · [fixed original](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/LICENSE)
 - [AMD-AGI/TraceLens / LICENSE](licenses/amd-agi-tracelens/LICENSE) · [fixed original](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/LICENSE)
-- [Ascend/MindSpeed-LLM / LICENSE](licenses/ascend-mindspeed-llm/LICENSE) · [fixed original](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/LICENSE)
+- [Ascend/MindSpeed-LLM / LICENSE](licenses/ascend-mindspeed-llm/LICENSE) · [fixed original](https://github.com/Ascend/MindSpeed-LLM/blob/90f862cd9459d5f5eb56d723b7b69f73c162a2c3/LICENSE)
 - [Ascend/MindSpeed-LLM / docs/LICENSE](licenses/ascend-mindspeed-llm/docs/LICENSE) · [fixed original](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/LICENSE)
-- [Ascend/MindSpeed / LICENSE](licenses/ascend-mindspeed/LICENSE) · [fixed original](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/LICENSE)
+- [Ascend/MindSpeed / LICENSE](licenses/ascend-mindspeed/LICENSE) · [fixed original](https://github.com/Ascend/MindSpeed/blob/30c1acb1e8bd96acbb3efe9ca52675d9877339ef/LICENSE)
 - [Ascend/MindSpeed / docs/LICENSE](licenses/ascend-mindspeed/docs/LICENSE) · [fixed original](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/LICENSE)
 - [baidu-baige/LoongForge / LICENSE](licenses/baidu-baige-loongforge/LICENSE) · [fixed original](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/LICENSE)
 - [baidu-baige/Loong-Megatron / LICENSE](licenses/baidu-loong-megatron/LICENSE) · [fixed original](https://github.com/baidu-baige/Loong-Megatron/blob/64c279afb879229cff12fb293624e3691990403f/LICENSE)
@@ -38,8 +44,8 @@
 - [NVIDIA/cudnn-frontend / LICENSE-MIT.txt](licenses/nvidia-cudnn-frontend/LICENSE-MIT.txt) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/LICENSE-MIT.txt)
 - [NVIDIA/cudnn-frontend / LICENSE.txt](licenses/nvidia-cudnn-frontend/LICENSE.txt) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/LICENSE.txt)
 - [NVIDIA/cudnn-frontend / NOTICE](licenses/nvidia-cudnn-frontend/NOTICE) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/NOTICE)
-- [NVIDIA/cudnn-frontend / LICENSING.md](licenses/nvidia-cudnn-frontend/LICENSING.md) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/LICENSING.md)
-- [NVIDIA/cudnn-frontend / THIRD_PARTY_LICENSES.txt](licenses/nvidia-cudnn-frontend/THIRD_PARTY_LICENSES.txt) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/THIRD_PARTY_LICENSES.txt)
+- [NVIDIA/cudnn-frontend / LICENSING.md](licenses/nvidia-cudnn-frontend/LICENSING.md) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/LICENSING.md)
+- [NVIDIA/cudnn-frontend / THIRD_PARTY_LICENSES.txt](licenses/nvidia-cudnn-frontend/THIRD_PARTY_LICENSES.txt) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/THIRD_PARTY_LICENSES.txt)
 - [NVIDIA/Megatron-Energon / LICENSE](licenses/nvidia-megatron-energon/LICENSE) · [fixed original](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/LICENSE)
 - [NVIDIA/Megatron-LM / LICENSE](licenses/nvidia-megatron-lm/LICENSE) · [fixed original](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/LICENSE)
 - [NVIDIA-NeMo/Megatron-Bridge / LICENSE](licenses/nvidia-nemo-megatron-bridge/LICENSE) · [fixed original](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53681c1aa264b54a1afa320830738382ee2a44f4/LICENSE)
@@ -51,7 +57,7 @@
 - [vllm-project/vllm / LICENSE](licenses/vllm-project-vllm/LICENSE) · [fixed original](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/LICENSE)
 - [verl-project/verl / LICENSE](licenses/volcengine-verl/LICENSE) · [fixed original](https://github.com/verl-project/verl/blob/2035f58dcb06d8cad4caee107b30f4045d724367/LICENSE)
 - [verl-project/verl / Notice.txt](licenses/volcengine-verl/Notice.txt) · [fixed original](https://github.com/verl-project/verl/blob/2035f58dcb06d8cad4caee107b30f4045d724367/Notice.txt)
-- [yuguo-Jack/Hyperloom / LICENSE](licenses/yuguo-jack-hyperloom/LICENSE) · [fixed original](https://github.com/yuguo-Jack/Hyperloom/blob/0425bde3f6e76e1588400c37d056dfd3bb75ac11/LICENSE)
+- [AMD-AGI/Hyperloom / LICENSE](licenses/yuguo-jack-hyperloom/LICENSE) · [fixed original](https://github.com/AMD-AGI/Hyperloom/blob/d79d7a70384e3ea6be737d296bdfd476965da471/LICENSE)
 
 ## 3. 官网教程与参考文档
 
@@ -84,3 +90,5 @@ HCU TraceLens 是当前集成依赖，其实际版本见 [manifest.json](manifes
 2. **分开记录来源与复核。** 固定原件链接和副本来源保留；核对记录注明日期、对应源码/网页基线和结果。副本不变则记录比较依据，不能只改日期；声明变化时保留旧材料适用的原件，明确新材料的许可范围，不覆盖历史证据。
 3. **明确未确认项。** 链接可访问、内容已抓取和允许再分发是不同状态。缺少适用依据时写清材料与缺口，新增内容先用链接和原创摘要，不把来源哈希校验通过记成授权核对通过。
 4. **检查引用与发布。** 同步本页、第三方工程说明和受影响页面，保留署名及必要通知；检查本地链接、打包内容和来源证据。常规文档/知识校验不判断许可适用性。维护入口见 [Wiki 组织规范](../docs/wiki-authoring-standard.md)。
+
+本轮登记的 NVIDIA 官方网站 HTML 响应及对应提取正文按原始哈希保留在 `knowledge/evidence/web/`，固定指纹、官方 URL 和文件映射见 [网站原件清单](../knowledge/catalog/web-originals-20261118.json)。仅保留本次登记的 16 页响应及正文，不包含网站外链资产；原始材料归属与网站声明保持不变，提取正文不是本项目原创。后续仅对支撑新结论且发生变化的必要页面留新版本，已知相同哈希直接复用。

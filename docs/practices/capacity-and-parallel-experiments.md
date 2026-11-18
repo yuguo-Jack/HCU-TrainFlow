@@ -19,7 +19,7 @@
 
 ## 2. HCU Train Simulator 的实际入口与限制
 
-已核对公开仓 [HYGON-AI/hcu-train-simulator](https://github.com/HYGON-AI/hcu-train-simulator)，固定提交 `baa611c6cb555b07c8727efcc975f8b39b1fec41`。以下是该提交的入口；以后依实际 checkout 的 `--help` 和源码核对，不保证未来命令不变。包版本仍为 1.0.0，不能仅凭版本号判断旧预测是否可复用。
+已核对公开仓 [HYGON-AI/hcu-train-simulator](https://github.com/HYGON-AI/hcu-train-simulator)，基础 CLI、并行与估算方法的固定基点为 `baa611c6cb555b07c8727efcc975f8b39b1fec41`，2026-11-18 又对照大库保留的 `fd2334cf8f37f207ad19ca1ee75b2be943d927b8` README、配置和 Profile 清单修订模型/读表范围。以下命令沿用原固定入口；实际执行仍依所选 checkout 的 `--help` 和源码核对，不保证未来命令不变，也不只凭包版本判断旧预测是否可复用。
 
 ```bash
 # 在独立参考 checkout 安装，用任务自己的模拟目录保存输入/输出。
@@ -38,17 +38,19 @@ hcu-train-sim run config.yaml --no-report
 
 | 核对项 | 固定源码行为与工作流处理 |
 | --- | --- |
-| 模型覆盖 | `models/registry.py` 与具体 adapter、ModuleSpec 决定估算结构。当前模型缺少专用 adapter 时，逐项核对混合层型、递归/残差状态、辅助训练头和专家布局；generic 输出不能作为完整结构已覆盖的证明。 |
-| 容量 | `estimators/memory.py` 按 PP/VP stage 估算；当前静态状态使用 BF16 混合精度 Adam 假设，激活按 2 字节计。`use_fp8_training` 只切换已建模的计算/通信路径，不改变显存或 benchmark 估算；不能据此宣称 FP8 状态容量已覆盖。总显存除参数数目不能代替峰值判断。 |
+| 模型覆盖 | `models/registry.py` 与具体 adapter、ModuleSpec 决定估算结构。新 V4/V4.1 嵌套配置已计入 CSA/HCA、共享 KV、mHC/Engram、视觉等部分，但不含独立 DSpark 训练，Muon/Sinkhorn 更新、Engram FP8 常驻与重叠预取等仍有未完整建模项。缺少专用 adapter 或输出降级 generic 时逐项核对，不能当完整结构已覆盖。 |
+| 容量 | 原固定 `estimators/memory.py` 按 PP/VP stage、BF16 混合精度 Adam 与激活 2 字节假设估算；新模型与计算 dtype 路由须另查实际实现。`use_fp8_training` 不证明全部权重、优化器/辅助状态和瞬时 buffer 已按 FP8 建模；不能将新 Profile 的 FP8 GEMM 命中解释成容量也同步减少。总显存除参数数目不能代替峰值判断。 |
 | 并行域 | dense 的 `DP=world/(TP×CP×PP)`，专家域的 `EDP=world/(EP×ETP×PP)` 独立构造；dense 分布式优化器按 DP×CP 分片，专家按 EDP 分片。核对实际引擎的组与整除条件，不能把 EP 再乘到 dense world 或共用一个 DP 分母。ETP 未指定时 MoE 默认取 TP；保存最终解析值。 |
 | 拓扑配置 | 普通节点与超节点通过 `use_supernode` 选择，分别填写 `intra_node_*` 或 `scale_up_1_*`/`scale_up_2_*`；后者的卡数是各域总卡数。解析器拒绝混入非活动模式字段，共同的 Scale Out/P2P 参数及整除条件在表驱动模式也须合法。旧普通节点别名能读取，不代表旧配置无需复核。 |
 | 自动求解 | `commands/solve.py` 的 GBS 输入是偏好下限，可能为气泡限制增大 GBS；不能直接把输出作为保留原训练语义的配方。重新核对样本/token、累积和学习率契约。 |
 | 搜索 | `commands/search.py` 可能随 VP 开启 overlap；逐项展开实际输出配置，不能把多个变量变化归因于单一切分。该提交的搜索直接调用估算器，不经过 `run` 的全部 Profile 命中/测量流程；排名不能当作已应用现场校准。无结果先查非法候选/错误，不直接宣称全参不可能。 |
-| Profile | 理论、已有校准数据和现场测量分别标记；该提交的内置 manifest 仍只有 BW1000/BW1100、Torch 2.7.1、DTK 26.04、BF16 两条记录。按完整环境指纹和输入匹配；attention 键现包含 `kv_seq`，旧键仅在显式 Q/KV 等长且条目 validated 时兼容，不能用于 CP 下非等长场景。`auto` 可能运行 GPU 算子，仍需资源准入。 |
+| Profile | 理论、读表缩放估计和当前训练实测分别标记。新 manifest 增加 SHB2000/SHB4000，只需硬件 selector；BW1000/BW1100 仍精确匹配硬件/Torch/DTK，不能跨设备或近似 shape 回退。attention 键的 `kv_seq` 与旧等长兼容条件仍须核对。`auto` 对缺失 shape 可能运行 GPU benchmark，仍需资源准入；仅离线分析明确用 theoretical 或匹配 builtin。 |
 | 理论效率 | GEMM shape 与通信 flow 大小分层默认开启；理论通信按物理链路层级与单条 flow 大小计效率，表驱动有效带宽和已命中的实测耗时不重复乘这些系数。保存模板效率、两个分层开关和来源，旧/新预测差异可能来自公式修正，不能当硬件变化或实测收益。 |
 | 精度与吞吐 | 预测不证明实际实现被调用、loss 等价、峰值安全或性能收益；最终依据目标镜像和源码短跑及正常阶段验证。 |
 
 MoE 的每 token active parameters 是计算参与量，不能替代全部常驻专家参数。当前 ETP 成本修正同时调整 token 聚集、中间维切分与通信 payload；SP 关闭时也不再按 TP 分摊 sequence 所有的部分。比较预测时保留实际 ETP/SP、完整参数量、adapter/ModuleSpec 和输出明细；新增公式测试只证明模型断言，不证明相同拓扑在训练引擎可用或实机误差已校准。
+
+新 SHB 读表的 standalone GEMM 前向与 DSA generation 被按 query 数、执行次数及模型反向/前向比例折算训练时间。DSA 数据覆盖含投影/indexer 的整个 attention 模块，已计入后相关子项标为 covered，不能再次相加；它也不替代 grouped GEMM 或独立 norm。报告即使显示 `builtin profile hit`，仍是声明范围内的缩放估计，不能记作训练前反向实测。V4 新算子的解析项和缺匹配后保留的理论项均需列出，并在实际引擎短跑中校准。依据见当前固定 [模型范围](https://github.com/HYGON-AI/hcu-train-simulator/blob/fd2334cf8f37f207ad19ca1ee75b2be943d927b8/README.md)与 [Profile 清单](https://github.com/HYGON-AI/hcu-train-simulator/blob/fd2334cf8f37f207ad19ca1ee75b2be943d927b8/src/hcu_train_simulator/profiles/builtin/manifest.yaml)；本轮未运行模拟器 auto、上游测试或 GPU。
 
 固定证据：[CLI](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/src/hcu_train_simulator/cli.py)、[模型注册](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/src/hcu_train_simulator/models/registry.py)、[显存估算](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/src/hcu_train_simulator/estimators/memory.py)、[配置与默认值](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/src/hcu_train_simulator/config/models.py)、[校验](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/src/hcu_train_simulator/config/loader.py)、[搜索](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/src/hcu_train_simulator/commands/search.py)、[求解](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/src/hcu_train_simulator/commands/solve.py)、[Profile 清单](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/src/hcu_train_simulator/profiles/builtin/manifest.yaml)、[Profile 键](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/src/hcu_train_simulator/benchmarks/profile.py)、[理论分层与拓扑](https://github.com/HYGON-AI/hcu-train-simulator/blob/baa611c6cb555b07c8727efcc975f8b39b1fec41/docs/tiered_efficiency.md)。普通任务读取这些证据不触发 HCU-Knowledge 更新。本轮只读核对源码和保留证据，未运行模拟器、上游测试或 HCU 短跑；原 `b7d8e6f3` 预测与实测保留其原始条件。
 

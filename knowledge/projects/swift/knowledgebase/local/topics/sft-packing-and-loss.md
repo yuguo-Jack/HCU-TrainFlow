@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: modelscope-ms-swift
   path: swift/pipelines/train/sft.py
@@ -49,6 +50,15 @@ sources:
   path: swift/trainers/mixin.py
   commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 83a76c73a27300aa76861d78be4d7f24ab03120d3105fa16272ff4f7fbf86903
+- source: modelscope-ms-swift
+  path: swift/template/base.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: 4cf23aca75017fd770e5a6ee510fe820ad50f71e182d8aa23fe6f30940ab00b6
+- source: modelscope-ms-swift
+  path: swift/trainers/mixin.py
+  commit: cf627bdd5d7e739a6cefc5829ab5696575615e8b
+  sha256: 9327e9deb5d4b8c9f582f3005cfa2eb89fa377274a4daf4a6f512191716bb1f9
+retrieved_on: '2026-11-18'
 ---
 
 # ms-swift SFT：packing、序列并行与 loss 归一化
@@ -122,3 +132,9 @@ SP 下 `GatherLoss.forward` 将本 shard 的 loss/labels 收集；backward 再 s
 ## 更新联动
 
 联动 Template、dataset packing、Seq2SeqTrainer、SP autograd、Megatron loss 和对应测试；Transformers 对 num-items/梯度累积的接口变化也属于依赖影响。问题检索关键词：`packing loss denominator`、`partial accumulation`、`chunked CE logits reuse`、`GatherLoss`。版本兼容、官方 PR 与 HCU 运行状态分别核验。
+
+## Tool follow-up 的模板与保存边界
+
+`cf627bdd5d7e739a6cefc5829ab5696575615e8b` 将 tool 结果和随后连续 user 文本合为一个 query，保留 query/assistant 配对；已渲染输入带 `_tool_user_followup`，不再二次展开其中字面模板占位。non-thinking prefix 的 user 条件也接受该标记。禁用 chat template 时 tool→user 组合会抛错，不静默按旧角色序列训练。
+
+这改变实际 prompt/label 的来源，SFT 数据验收应加入已序列化工具调用、ReAct/普通工具、多个 follow-up、字面占位与 truncation，比较有效 target 和 mask；本页原有sum/count与CP/packing数学关系不因此改变。模型保存路径新增的 qwen4_exp 专用处理也要按目标模型验证，不能只检查文件生成便宣称参数完整。

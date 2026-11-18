@@ -510,7 +510,7 @@ flowchart TD
     EXP --> LOCAL["TrainFlow 自带 Wiki 统一检索与原文阅读<br/>官方引擎 / 依赖、通用环境经验、最终模型总结<br/>专题、案例、教程、PR、全仓目录"]
     LOCAL --> ANSWER{"已有证据足以回答当前问题？"}
     ANSWER -->|是| USE["应用到当前假设<br/>实施前核对现场条件，之后实际验证"]
-    ANSWER -->|否| PR["按问题在线搜已收录 / 未收录 PR<br/>描述、普通评论、行内评论、顶层 review"]
+    ANSWER -->|否| PR["按问题在线搜 PR / 官方页面入口<br/>按需读正文、固定代码与必要讨论"]
     PR --> CODE["追到固定 head / base 源码<br/>完整函数、调用者、对应底层依赖和测试"]
     CODE --> USE
     CODE -.-> CACHE[("任务 workspace 的 reference / 查询缓存<br/>原始来源与固定提交，按需复用")]
@@ -528,7 +528,7 @@ flowchart TD
     DELIVERY --> PUBLIC["公开前按目标仓规则审阅<br/>只交付可公开方法 / 代码 / 获准示例"]
     DELIVERY --> TRACK["经验中记录交付关联<br/>draft / submitted / merged / rejected / superseded"]
     REFRESH["官方资料按相关版本定向更新<br/>任务初期 / 问题驱动 / 版本漂移"] --> SCOPE["先审收录范围、相关性和复用价值<br/>检查带理由的文档排除项<br/>完整源码目录仍可查询"]
-    SCOPE --> FETCH["目录、文档、源码和 PR 讨论增量采集<br/>排除项不再入库；既有页冲突显式处理<br/>失败 / 分页未完成保留待办"]
+    SCOPE --> FETCH["固定版本 / 登记路径与有界 PR 入口发现<br/>必要目录与文档按需检查，精选证据正式保留<br/>失败 / 分页未完成保留待办"]
     FETCH --> IMPACT["联动复核总览、专题、案例<br/>相关 Skill / 命令 / 解析器用法"]
     IMPACT --> APPLY["绑定当前页与来源哈希的回执<br/>apply 版本锁 → 重建检索索引"]
     APPLY --> INSTALL["验证知识、阅读入口与受影响用法<br/>同步本机包和六个 TrainFlow Skill<br/>核验绑定与内容，不更换运行中依赖"]

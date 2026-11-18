@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
@@ -44,6 +44,38 @@ sources:
   sha256: e29e6fdef3be07b400a22661fd07e0078870bad0b4e09cb3e4df5e373f37888f
   url: https://docs.nvidia.com/cudnn/fe-oss-apis/overview
   revision_kind: web-content-fingerprint
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/__init__.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 4327a86e9640c60e480f6fa56af7b7154096bb9c17dd3b2d00803e1413da4100
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 8dfe37611b359603153518bb88df3b58f51f387380211c444888296f11329961
+- source: nvidia-cudnn-frontend
+  path: docs/utilities/python_graph_and_execution_backends.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 71ea0a2933a86945fdafe771e0c37b4f5fbb958722bce80b2868bed0d9e1707b
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/support/README.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 548e12955a7a814f66501cd6c29396de323a73db12b7e9ec7cc950aad34b1381
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/support/sm90.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 0e31df3d5f748be539204f824b428945d62fd89d18e9b6734b2c477835586647
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/support/sm100.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: cb932367bf5dcb75b4d2f56dcd7c274438851e6fe7f3d99f8e8da907ad470c51
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/support/sm107.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: cac8c941e8db72194abb19c99bf527b8ac83b28bf48334be948ef49abc45c321
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/support/sm120.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 054e7604b8274fd9c1b4d90bbf865ca15eef456b55413d0d368201717169c7a2
 ---
 # cuDNN Frontend 官方工程：Graph、开放 Kernel 与训练调用链
 
@@ -73,6 +105,10 @@ cuDNN Frontend（常被写成 cudnn-fronted）提供 C++/Python 图接口，也�
 
 详细入口：[安装与单测](../guides/build-run-test.md)、[Graph 与 plan](../topics/graph-and-plans.md)、[训练 attention](../topics/attention.md)、[开放融合与稀疏算子](../topics/open-kernel-fusions.md)、[集成性能案例](../cases/host-dispatch-and-cache.md)、[教程与更新](../changes/tutorials-and-update.md)。
 
+## 当前支持文档的迁移
+
+`python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` 在本固定版本已明确标为历史 tracker，正文可能混有旧快照与开发记录。当前支持入口转到同目录 `support/README.md` 及分架构页；缺少已迁移章节不等于该功能不支持。查某个训练模式时，应读对应固定页、实际 plan admission 和测试，不能沿旧表推导全部架构的最新支持，也不因显式 engine 拆分就认定数学语义或默认选择都变了。
+
 ## 来源与版本复核
 
 - [nvidia-cudnn-frontend: README.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/README.md)
@@ -87,8 +123,22 @@ cuDNN Frontend（常被写成 cudnn-fronted）提供 C++/Python 图接口，也�
 
 ## 版本线与当前能力入口
 
-源码专题跟踪官方 `develop@f88a1ef2a35bc405967691dd798eb062298fcd9a`，CMake 项目版本为1.33.0，原件与正文复核日期为2026-11-04；已发布包、`main` 和官网滚动版本另行确认，不能按分支名字认定它们包含相同机制。运行配方必须固定实际 Frontend、cuDNN backend、CUDA、GPU 和可选 DSL 版本。
+源码专题本次跟踪官方 `develop@623ad8ff498acdaa860fbc8191d2afeaea90e400`，项目版本仍为1.33.0，选定源码复核日期为2026-11-18；此前固定原件与引用继续保留。已发布包、`main` 和官网滚动版本另行确认，不能按分支名字认定它们包含相同机制。运行配方必须固定实际 Frontend、cuDNN backend、CUDA、GPU 和可选 DSL 版本。
 
 [FlexAttention plan 与 autograd](../topics/flex-attention-plans.md) 补足可编译稀疏 mask 的执行生命周期；[开放 Kernel](../topics/open-kernel-fusions.md) 包含 grouped GEMM、BSA/DSA 的缓冲与精度约束。这些源码结论是候选方法，不构成 HCU 库的支持清单。
 
-当前更新补充 CUDA Graph retention 与 direct population、Python engine 计划序列化、SDPA 累加类型通路及默认候选变化、BSA KPage 与 DSA 反向资格。nanobind、地址/stride 校验、plan/metadata 排序和 FlashInfer 消费者合同继续保留。官方文档位于 `docs.nvidia.com/cudnn/`；高层 `with cudnn.Graph` 与显式入口按版本说明，某些网页仍保留旧 JAX 别名，不将官网与源码拼成一套调用。
+本次补充执行 recipe 的版本与资格失效、逐 plan 的 Stats-stride 能力声明、caller-owned workspace 容量与设备/stream 上下文，以及 BSA 元数据缓存和 DSA deterministic dKV 模式。原有 Graph retention、direct population、nanobind、地址对齐、plan 排序与 FlashInfer 消费合同继续保留；新接口不扩大 HCU 的部署支持。官方文档位于 `docs.nvidia.com/cudnn/`；高层 `with cudnn.Graph` 与显式入口按版本说明，某些网页仍保留旧 JAX 别名，不将官网与源码拼成一套调用。
+
+## 2026-11-18 固定依据
+
+- [python/cudnn/__init__.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/__init__.py)
+- [python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md)
+- [docs/utilities/python_graph_and_execution_backends.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/docs/utilities/python_graph_and_execution_backends.md)
+
+新增迁移支持文档的固定入口：
+
+- [python/cudnn/sdpa/frost/support/README.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/support/README.md)
+- [python/cudnn/sdpa/frost/support/sm90.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/support/sm90.md)
+- [python/cudnn/sdpa/frost/support/sm100.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/support/sm100.md)
+- [python/cudnn/sdpa/frost/support/sm107.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/support/sm107.md)
+- [python/cudnn/sdpa/frost/support/sm120.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/support/sm120.md)

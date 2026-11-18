@@ -46,6 +46,8 @@ Inductor 调试原件的开关也要追消费者：已固定 HCU 2.13/2.16 `torc
 
 `torch.compile` 可用与 Graph replay 安全分别验收。当前 HCU Primus Turbo 在特定 DTK 的 attention backward 注册中保留编译，却显式标记 `cudagraph_unsafe`；不要为追求整图删除这类门禁。先检查实际 op 注册、fake/meta、mutation/alias、生成代码和 capture 限制，再决定切分边界与回退。自定义流水或 Cython launcher 升级后也要核对当前 device/stream 与参数绑定，不能用旧缓存或一次 eager 通过替代变化输入 replay。
 
+支持范围按具体 op 而非整个库判断。LightOP 当前 [paged KV gather/dequant](https://github.com/HYGON-AI/lightop/blob/646c8808329ce423f9c4a21921a944e7c71d9b24/docs/migration/gather_and_maybe_dequant_cache.md) 仍为原地写 dst、返回 None 的 eager 路线，Dispatcher/FakeTensor 是占位；其他 op 可 compile 不证明它也能捕获。HCU Torch 2.13 新 masked FlashAttention 也需真实选中 flash、匹配 bool mask 形状/连续性、dtype/head_dim 和 Cutlass 接口；additive/broadcast mask 或只允许 flash 的失败不能静默改写为已命中。分别验前反向、变化 mask、dropout replay 和版本门禁，再复用编译结果。
+
 编译期常量和缓存的失效属于正确性检查。TE UB、后端、量化 recipe、布局或工具链变化后，核对当前版本如何 reset/recompile，验证冷/热缓存都命中正确实现。对会写 out、累加梯度或更新状态的编译/autotune 路线，先检查准备阶段是否真的执行 kernel；在独立输出上准备或按实现保证只更新一次，不能把第一次执行当纯编译而遗漏副作用。具体梯度与状态检查见[底层库接入](hcu-library-integration.md#融合梯度与低精度状态的接入检查)。
 
 运行时版本变化后复核 Graph 的 RNG 保留、跨流依赖和释放协议。HCU 2.16 专项已有 capture 前预分配 RNG seed/offset、replay 流跟踪及释放前等待；这不取消 capture 原流到 replay 流的执行依赖，也不能倒推旧 2.13 已有同样实现。虚拟地址快照/IPC 导入与 Graph 原地址恢复分别核验；当前该原地址恢复在 `USE_ROCM` 被拒绝，不能从 CUDA 接口或测试推导 HCU 可用。

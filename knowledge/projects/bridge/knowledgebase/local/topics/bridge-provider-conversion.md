@@ -9,8 +9,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: fixed source delta and actual consumer review; historical pins retained; no HCU runtime validation
 sources:
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/models/gpt_provider.py
@@ -92,7 +92,27 @@ sources:
   path: src/megatron/bridge/models/conversion/modelopt_utils.py
   commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: ecd7a9ceeaaf9161f3348921e82b4b0a64705d74e8b2064425cf2be58620612c
-retrieved_on: '2026-11-04'
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/models/gpt_provider.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: da3c92f65431864e3079e09167dbcdb96e911731e0bff73d82795894977fd625
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/models/conversion/auto_bridge.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: 1cb276ce0f744b9124585b1a4d0042bf64057b315ad137a3f8602b3df4a8f3c1
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/models/conversion/modelopt_utils.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: 7eadcfe00408dd17f9758cac41ce940daf333dc4f620da32572470e3a6aae0f4
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/models/hf_pretrained/state.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: 1f52430a39ee3716d4be960f5be93814c83c5618931e27d280069670b03e352b
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/models/conversion/utils.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: 026e4a053606654a60059b72d2ed82c3877b2176995aeb47bfc0cbab293f9c3d
+retrieved_on: '2026-11-18'
 ---
 
 # Bridge：模型配方、Pipeline Provider 与 HF 权重映射
@@ -105,7 +125,7 @@ HF权重可读不意味着Megatron模型结构和训练数学相同。recipe组�
 
 `GPTModelProvider.provide`按pre/post-process、VPP stage、灵活PP布局构建MCoreGPTModel；layer spec可以是ModuleSpec或callable，默认local/TE/TE full layer选择不同模块。`_callable_spec_kwargs`按声明参数传vp_stage与provider自己的PP group rank，避免decentralized场景错误取global MPU。
 
-MTP独立stage可能没有decoder layer，`mtp_block_spec`重新取得decoder spec并调用模型的`mtp_layer_spec_transform`。本次固定 `gpt_provider.py` 的最终 `get_gpt_mtp_block_spec` 调用仍只传 vp_stage，不等同于 [#6406](../../upstream/prs/NVIDIA-NeMo--Megatron-Bridge/PR-6406.md)提出的最终rank传递修复。该讨论提供特定已固定Core的CPU契约回归，不是所有GPU/decentralized组合已通过。
+MTP 独立 stage 可能没有 decoder layer，`mtp_block_spec` 仍重新取得 decoder spec 并调用 `mtp_layer_spec_transform`。固定 `11d8b349` 已新增显式 `pp_rank`，传到 callable spec 和最终 `get_gpt_mtp_block_spec`；旧 `41af2dcf` 尚缺最终 rank 传递的判断已过时。显式 rank 优先于 provider 的组，未显式给 callable 时才从 `_pg_collection.pp` 推导。普通 `provide` 的 MTP 调用仍未显式传该参数；无 MPU 的其他 builder 必须核对自己的调用点和所属 rank，不能把默认 None 当正确 rank。[#6406](../../upstream/prs/NVIDIA-NeMo--Megatron-Bridge/PR-6406.md)的旧 CPU 讨论范围也不等于所有 GPU/HCU 组合已通过。Provider 删除本地 `moe_grouped_gemm=False` 覆盖后继承所选 Core 默认值，升级要看最终 spec，不保留旧默认假设。
 
 模型替换decoder后，还应确认低精度模块完成初始化。[#6140](../../upstream/prs/NVIDIA-NeMo--Megatron-Bridge/PR-6140.md)针对Qwen3VL replacement重新执行precision finish_init；不能仅检查顶层FP8 flag或TE包存在。
 
@@ -116,6 +136,14 @@ MTP独立stage可能没有decoder layer，`mtp_block_spec`重新取得decoder sp
 流式权重转换/分rank导出可降低完整权重同时物化的主存/显存峰值，但map/reduce和I/O有代价。没有读实际导出路径就不能估计峰值，更不能为了节省内存改权重dtype后省掉数值回归。PEFT初始化frozen base与adapter的load/save分开，LoRA/DoRA结构和训练参数集合明确。
 
 当前 `export_adapter_ckpt` 按模型 family 的 `USE_MODEL_CONFIG_FOR_CONVERSION` 选择 builder-backed ModelConfig/get_model 或 legacy provider 路线。前者设置 FP32 参数/pipeline 和 CPU 初始化，先装 base weights 再接 LoRA pre-wrap hook；target_modules 改由 model bridge 的映射解释，不能只按参数后缀猜所有家族的 PEFT 名称。text-only 与特殊多模态 processor 的加载也有独立分支。对应 mock 单测能检查选择和字段，真实分片、权重与 logits 仍需往返和训练验证。
+
+## HF config、忽略集合与重复读取
+
+`AutoBridge.from_auto_config` 在按 reference keys 投影之后，调用 `carry_rope_into_rope_parameters` 搬运 Megatron 的 RoPE 值，避免新版 Transformers 的 reference rope_parameters 覆盖模型差异。实际 helper 只改含 `rope_theta` 的平面字典；不同 scaling type 会替换旧 scaling 项、保留模型本身的 RoPE 参数，相等配置保持原样。按 attention type 嵌套的 rope_parameters 和不含该结构的配置原样返回，不能推导所有多模态/嵌套 RoPE 已解决。仍须比较合成 config、固定输入 logits 与数值。
+
+普通 HF export 可由 model bridge hook 声明精确 `ignored_source_keys`，与 prefix/suffix 一起过滤预期源布局；它表达共享参数副本等有意不产出的 key，不是随意忽略 missing tensors 的许可。plain dtype 导出的可配 suffix 也校验为非空字符串 tuple。source map 原本不存在与“原有 key 全被过滤”走不同分支，后者不会把意外 tensor 当任意新模型导出，严格模式先排空 generator 再协调失败。
+
+StateSource 的小张量只在重复读取时克隆入 cache，首读仅登记；复用 handle 的后续读在必要时用 fresh safe_open，避免调用方原地改写污染下次 refit。返回 cache 时仍 clone，相关开关和实际 source/shard 身份需记录。这是读权重的缓存策略，不改变权重正确性要求，也不保证所有转换路径为恒定内存。
 
 ## DPO：配对、reference 产物与实际分母
 
@@ -142,9 +170,19 @@ recipe单测核对模型配置和并行字段，真实转换还需TP/PP边界、
 
 ModelOpt 导出现在先 `build_hf_modelopt_export_plan`，再消费 prepared tasks；grouped API 要求各 rank 同序消费（含空组和 StopIteration），本地消费者完成后才进入下一组。它拒绝 unmerged adapters 和定制 HF export override；旧 quant_mode 参数式调用不能直接当作现接口。普通 HF 导出还区分真实量化状态 sidecars 与 plain weight dtype，config-only 路线会在 rank0 收集完整 CPU state，不能把所有路径都称为恒定内存 streaming。
 
-保留依据：`gpt_provider.py` 的最终 MTP 调用、Qwen3 基础 recipe/测试、DPO 成对数据与评分/step/loss 原件字节未变，故保留原参数/数值条件和 PR 修复尚未进入该 provider 的结论；新 builder recipe 与导出分支没有取消这些数据和状态契约。
+未变依据：Qwen3 基础 recipe/测试、DPO 成对数据、reference 评分和 step/loss 原件仍支持原目标/分母约束。Provider、HF StateSource 与量化导出这次确有变化，不再沿用其“字节未变”结论；历史证据保留各自 commit，当前父 Core 锁也独立于其他官方 Core HEAD。
 
-补采 `ModelOptExportPlan` 确认 plan 保存 tasks、quantization config、参数集合和本地量化 spec；`prepare_modelopt_export_tasks` 每次检查 spec 未改变并安装新 stream hooks，不能把旧 plan 用于已改 recipe 的模型。映射拓扑、TP/EP 量化一致性和 tied aliases 另有校验；当前拒绝 grouped HF expert weights、部分定制 QKV/Mamba layout / permute mapping，`check_exportable_quantizers` 也拒绝无法带出的已启用 KV/output 等 quantizer。prepared plan 不是任意量化格式都可导出的证明。
+当前 `ModelOptExportPlan` 除 tasks/config/spec 还记录 `traced_rows`。定制映射可通过自己的 megatron_to_hf 对整数行列标签转换来证明完整行选择，只有该约束满足才能重用对应量化状态；维度置换、非整行布局及不支持拓扑仍拒绝，不能继续笼统称所有定制 QKV/Mamba 都不可导出。QKVG、concatenated QKV、GDN 各按自身布局拆分，GDN gate 保持未量化。量化 linear 输出必须是受支持的 `.weight`，KV/output 等无法带出的 quantizer 仍需显式检查。
+
+grouped expert 新增的例外是 `oai_mxfp4_export` 的 OpenAI weight-only MXFP4：要求对应 experts 的量化/spec 一致，不允许部分 experts 留 BF16，且该格式的其他层保持 BF16；导出 `_blocks/_scales` 与匹配 config。一般 grouped HF experts 或任意 FP4 格式并未因此全部支持。plan prepare 仍检查 recipe/spec 没有改变，TP/EP 同序 collective 和当前权重布局不可省略；这里没有执行真实多 rank 量化导出。
+
+## 2026-11-18 固定消费者
+
+- [src/megatron/bridge/models/gpt_provider.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/models/gpt_provider.py)
+- [src/megatron/bridge/models/conversion/auto_bridge.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/models/conversion/auto_bridge.py)
+- [src/megatron/bridge/models/conversion/modelopt_utils.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/models/conversion/modelopt_utils.py)
+- [src/megatron/bridge/models/hf_pretrained/state.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/models/hf_pretrained/state.py)
+- [src/megatron/bridge/models/conversion/utils.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/models/conversion/utils.py)
 
 ## 固定证据与复核范围
 

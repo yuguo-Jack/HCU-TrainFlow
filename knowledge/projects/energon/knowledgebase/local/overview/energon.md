@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: nvidia-megatron-energon
   path: README.md
@@ -77,9 +78,33 @@ sources:
   path: tests/test_filter_index.py
   commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: bfa633d01e0fdd6405f738bf1ccebf8d10138c1e229ff59767f28b7b6e25af4a
+- source: nvidia-megatron-energon
+  path: docs/source/advanced/packing.md
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 807ed86e4cb10264d8f604f7d0bd752c475924bdfbf0e23591d766cfa3857d22
+- source: nvidia-megatron-energon
+  path: docs/source/basic/recipe.md
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 30f724c7f0a33a4a9ab1810993bdb8ca975fd0ba87443240876471ff85cfaf66
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/task_encoder/base.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 53e8825432d392d36f5308d77dbbbbffb28a8a0ae96d018959e15fde5f641403
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/rng.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 23f5973dc29c5faaa6eb2f996e3e934a29fb6f7ef864310f4fa352e76469391a
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/flavors/common/dataset_sampler.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: fe88bf4ed490ef249b253face9960ba55f597ddb604b77b07d56793bdfad7e3f
+- source: nvidia-megatron-energon
+  path: pyproject.toml
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 3ec4dcaa9a6d5ebeccc35b8f7b9a5076beb4d93af20077e8f86d431b19226b3a
 pr_sources:
 - pr-nvidia--megatron-energon-302
-retrieved_on: '2026-11-04'
+retrieved_on: '2026-11-18'
 ---
 
 # Megatron Energon：数据组织、Packing、吞吐与确定性恢复
@@ -88,7 +113,7 @@ retrieved_on: '2026-11-04'
 
 Energon是可独立使用的多模态数据加载/处理组件，负责数据混合、shard、随机顺序、编码、packing、batch及可恢复加载，不执行GPU模型训练或优化器。Megatron/Bridge等消费者负责mask/position/模型输入、loss与保存关联；GPU空泡可能来自本组件，但不能据此把它当kernel分析库。
 
-本页固定develop `e33bbe768a4f7a629377a365c8af9a7b98b1219e`，官方README提示研究型API可能变化。实际HCU父仓锁定的Energon与此develop分别核对，不能自动用latest替掉训练依赖。
+本页保留 2026-11-04 的 develop 固定证据 `e33bbe768a4f7a629377a365c8af9a7b98b1219e`，本次新增接口在下方按新固定版本说明。官方README提示研究型API可能变化。实际HCU父仓锁定的Energon与此develop分别核对，不能自动用latest替掉训练依赖。
 
 ## 2. 目录与问题路径
 
@@ -105,7 +130,7 @@ Energon是可独立使用的多模态数据加载/处理组件，负责数据混
 | `tests/test_dataset.py`、`test_dataset_det.py`等 | 数据覆盖、生命周期、确定性/恢复；IO/平台条件单列 |
 | `docs/source/basic`、`advanced` | 使用、TaskEncoder、恢复、packing、并行、错误处理 |
 
-本轮官方 internals 已补充架构、格式/存储、Recipe checkpoint、savability、packing/blending 与兼容性文档；继续阅读时仍需沿实际类与测试确认，文档齐全不表示所有路径已执行验证。
+2026-11-04 的官方 internals 快照已补充架构、格式/存储、Recipe checkpoint、savability、packing/blending 与兼容性文档；继续阅读时仍需沿实际类与测试确认，文档齐全不表示所有路径已执行验证。
 
 ## 3. 安装与依赖
 
@@ -123,7 +148,7 @@ library从WorkerConfig和TaskEncoder创建train/val dataset，再`get_loader`或
 
 当前混合配置主入口为 `Recipe`，旧 `MetadatasetV2` 通过带弃用告警的别名保留，不能据此推定已移除的 v1/joined 数据集支持仍在。样本和 batch 的规范字段是 `__tags__`，dataset/cooker 使用 `tags`/`has_tags`；兼容 `subflavors` 并不允许新旧字段同时传入。迁移配置时同时检查 cooker 选择、样本派生和 batch 元数据，见[编码专题](../topics/energon-encoding-packing.md)。
 
-此前 sampler 已引入常量内存 Feistel permutation，本轮所引 sampler / sharder / RNG 原件字节不变：保存 seed/offset 而非整个待处理索引列表；`max_samples_per_sequence=1` 使用紧凑 range offsets。收益是降低大数据集 host 索引状态，不能据此声称旧 checkpoint 或旧样本顺序兼容，详见[恢复专题](../topics/energon-recovery-throughput.md)。
+此前 sampler 已引入常量内存 Feistel permutation，2026-11-04 所引 sampler / sharder / RNG 原件字节不变：保存 seed/offset 而非整个待处理索引列表；`max_samples_per_sequence=1` 使用紧凑 range offsets。收益是降低大数据集 host 索引状态，不能据此声称旧 checkpoint 或旧样本顺序兼容，详见[恢复专题](../topics/energon-recovery-throughput.md)。
 
 ## 5. 样本、数值与状态所有权
 
@@ -156,13 +181,21 @@ watchdog timeout会打印worker栈，只有相应fail_on_timeout策略才导致�
 
 `wiki-search-pr "restore packing/loader close" --engine energon`可补未收录问题，随后读固定代码/测试。更新loader/worker/TaskEncoder/wrappers与消费者Bridge的数据checkpoint同时复核本页和两专题；major版本、DP/worker数、encoding变化保留各自恢复范围。
 
-本轮固定 develop `e33bbe768a4f7a629377a365c8af9a7b98b1219e`。`DatasetReference` 新增 `filter` 字段，MANIFEST / JSONL / BINIDX 入口将其作为 `DatasetLoader(filter_name=...)` 传递，嵌套 Recipe 则明确拒绝该字段；这只是已读入口的语义，不能由类型识别推导所有格式、索引或训练消费者已验证。过滤会改变可见样本集合、顺序/数量和数据身份，采用前连同 filter/index、来源指纹、split/encoder、恢复状态一起固定。
+2026-11-04 历史复核固定 develop `e33bbe768a4f7a629377a365c8af9a7b98b1219e`。`DatasetReference` 新增 `filter` 字段，MANIFEST / JSONL / BINIDX 入口将其作为 `DatasetLoader(filter_name=...)` 传递，嵌套 Recipe 则明确拒绝该字段；这只是已读入口的语义，不能由类型识别推导所有格式、索引或训练消费者已验证。过滤会改变可见样本集合、顺序/数量和数据身份，采用前连同 filter/index、来源指纹、split/encoder、恢复状态一起固定。
 
-保留依据：README、CLI、loader / savable loader、TaskEncoder、tags、sampler / sharder / RNG 及所引生命周期/确定性测试字节不变，故保留 WorkerConfig 归属、packing/错误策略、snapshot+offset 和 close 的现有边界。Python 最低版本变化与新增 filter 入口不能当作已有 checkpoint 或 HCU 训练集成回归通过。
+2026-11-04 / e33 快照的保留依据：README、CLI、loader / savable loader、TaskEncoder、tags、sampler / sharder / RNG 及所引生命周期/确定性测试字节不变，故保留 WorkerConfig 归属、packing/错误策略、snapshot+offset 和 close 的现有边界。Python 最低版本变化与新增 filter 入口不能当作已有 checkpoint 或 HCU 训练集成回归通过。
 
 补采的 filter 实现将原样本整数地址映射为过滤后的地址：manifest sidecar 位于 `.nv-meta/filter_<name>.json/.idx`，单文件数据使用旁置同名后缀，当前索引版本为 2。`FilterView` 验证版本、shard 名/顺序、原样本计数和 primary 文件 byte size，并按选定 split 的 shard 顺序翻译；它不校验 companion 文件或完整内容 hash，同大小改写不由这些检查自动识别。`TranslatedIndexReader` 将 restore key 的整数位置改为 filtered_index，故必须保留对应 filter 原件，不能换 filter 后沿用旧位置。上游 `test_filtered_training_recipe_checkpoint`、stale filter、分 rank/worker、BINIDX passthrough 测试提供特定范围参考，本轮未运行，不扩大为全部格式/分布式恢复兼容。
 
 2026-11-04 固定 GitHub 最近10条 release 观测包含 [`7.4.1`](https://github.com/NVIDIA/Megatron-Energon/releases/tag/7.4.1)（2026-08-03）。本页当前 develop 的 recipe/filter-index 实现与该发行版分开，不由版本号推出功能包含；这不是全部 release 历史审阅。
+
+## 当前 develop 的数据接口边界
+
+2026-11-18 固定 `8ba04a3aa4200725a136258e00a6facf3bd15acd`：TaskEncoder 增加 streaming packing、partial sample/pushback 和分组 packing；Recipe 的 `blend_weight_unit` 默认仍是 `samples`，自定义 token 等单位要登记对应 metric，嵌套 blend 不继承外层单位，单位不一致会拒绝。分组后再次混合需要对 packed 输出定义 encoded-stage metric，不能把样本比例当有效 token 比例。
+
+`SystemRng.seed` 改为仅操作 Torch CPU 默认生成器、NumPy 和 Python RNG；`restore_seeds=True` 不再隐式触碰 CUDA RNG。涉及设备随机变换的 encoder 须自己管理对应随机状态，并比较连续/中断恢复的未来样本与数值。新增可选 `parquet` extra 要求 `pyarrow>=14.0.0`，不随本次 Wiki 维护安装。
+
+支持 `SequentialSampleReader` 的 sampler 现在按 active slice 连续读取，重置/新迭代/关闭会释放旧 iterator，恢复从保存的整数位置重新开流；filter reader 同步翻译 restore key。这里保留的是同版本代码边界，不能由新增 IO 路径推出所有存储吞吐提升或旧 checkpoint 兼容。详见两个专题。
 
 ## 固定证据与复核范围
 

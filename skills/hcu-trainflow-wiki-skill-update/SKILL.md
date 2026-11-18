@@ -31,6 +31,8 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 
 HCU 大知识库已变更或用户要求对齐时，先只读核对其当前提交、变更清单与 TrainFlow 的真实消费点。若仅改变存储或发现策略，检查读者、命令、绑定和受影响 Skill 即可，不为此重新采集上游或逐项重验未变训练事实。只有工程、工具接口、依赖或能力边界确有变化时，才检查相关阶段用法并修订对应指南、适配器和测试；有效固定证据继续复用。范围、结论与未验证项写入现有记录，不附带更新 HCU 大库或改变正在训练的依赖。
 
+全库更新已独立发布时，将该提交/标签作为本轮联动的固定输入，按重要修订及真实消费者筛选；来源头部变化不自动替换历史逐文件证据或部署依赖。另行核对本仓 `thirdparty/manifest.json` 的大库绑定锁与已安装搜索入口，保持受管本机绑定。正式复核收据与必要原件随仓保留，`.work` 中的采集/比较缓存只承担可再生过程记录，不能成为共享结论的唯一读取入口。
+
 1. 检查公共 GitHub/文档权限、限流与实际访问，不把 404 当成已删除。读取 knowledge/sources.json 与已有 observed/reviewed 游标。
 2. 先读项目 `docs/wiki.md` 与 `docs/knowledge-architecture.md` 的“自动更新时的内容筛选”。检查 `knowledge/storage.json` 和来源策略：discovery-first 下 `wiki-update PROJECT SOURCE` 以固定版本/登记路径和轻量 PR 发现为范围；不附带全历史评论/review 补采或全仓目录深读。需要新文档时按实际问题检查官方入口，筛选后登记；低相关路径写入 document_exclusions，避免下轮重建。显式 wiki-inventory / wiki-sync-docs / wiki-refresh 仍可用于有需要的深入检查，不能把未执行范围宣称完整覆盖。网页指纹不当 Git SHA；迁站按 docs/wiki.md 核对 canonical 与受影响链接。
 3. 普通 PR 通过 `wiki-search-pr` 联搜，或 `wiki-sync-prs` 查看有界近期候选；只发现入口，不自动创建每条 PR 的正文/原始 JSON 副本。用 URL 或 `wiki-pr` 按需读取正文和固定版本，需要讨论/文件时显式加 --discussions / --files。只有重要变化或现有解释需要时，先核对公开归属与最少充分证据，再显式 --retain-project 正式保留。不运行每七天全历史讨论审计；旧不可用项、未读范围及固定历史保留，不因取消镜像虚报已补齐。

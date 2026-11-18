@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: selected mechanisms, recipes and tests at pinned official source; not every
+  model/backend and no HCU runtime execution
 sources:
 - source: deepspeedai-deepspeed
   path: deepspeed/runtime/zero/config.py
@@ -53,6 +54,39 @@ sources:
   path: tests/unit/runtime/zero/test_zero_tensor_fragment.py
   commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
   sha256: ebbd12aa05d351d3d0c76b559acaaff219ea6b4830cee1b47ea4d8a5883f3cd5
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/config.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 34033db3576399499f67ed1b37d90c279a0506dd2b5bddda1715f3c189592f73
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/engine.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 97cf4fac9f0cfdb1e1ac5a289d2a4ec312843274c4c1c08bb6e8c1225c9de75e
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/stage_1_and_2.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 61e0f21a348f3c98c44c32225ab25e1beddced12f36388a578acb1a608a8a454
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/stage3.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: d0abe8464970a378791847f64599395a26fbf5cca830676d9dffb4da5ddea1e3
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/partition_parameters.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 5d10e92b8ba6835cc47ef84dbd25442a6752b6ffdc0232da3478ccc858033740
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/parameter_offload.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 782d5dd87205f6d8938d7a0beab230c8523a37ca2b3b32a935fd6f21132db0b9
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/partitioned_param_coordinator.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 17d04b568e7d1fd15d6cfdce465cd8cb36e81e259e846db82304e637b7b27fee
+- source: deepspeedai-deepspeed
+  path: deepspeed/ops/adam/cpu_adam.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 8af512c18359b51668bb02392ef851f1e3539d30e030c9c518157c4fabd10767
+retrieved_on: '2026-11-18'
 ---
 
 # DeepSpeed ZeRO：分片、参数预取与 offload 生命周期
@@ -88,7 +122,7 @@ ZeRO 要减少的是模型训练状态的重复驻留，但训练时仍有全量
 
 当前 `d8241a9ba266405e1a58fadf19e24b2370f6d7fa` 把 `all_gather_coalesced` 的 `ds_id` 排序提前到按partition group分批之前。prefetcher可能给出跨rank迭代顺序不同的set；只保证每组内部flatten顺序仍不够，组间collective次序也要相同。新增 `TestMultiGroupGatherOrder.test_rank_dependent_param_order` 用两个同成员但不同对象的group和相反参数列表验证权重仍正确，不能把group成员相同当成collective可任意互换。
 
-coordinator文件与原trace/wait/release消费链内容哈希未变；旧stale-handle测试继续保留。新排序解决组间发起顺序，不免除handle完成和参数释放后的状态检查。
+2026-11-04 的 coordinator 与前轮 trace/wait/release 消费链字节相同，因此当时保留旧结论；2026-11-18 的新版本另有下述实例缓存、NVMe 去重与销毁修订。旧 stale-handle 测试继续保留，新排序也不免除 handle 完成和参数释放后的状态检查。
 
 ## 参数选择、收益与代价
 
@@ -128,6 +162,32 @@ ZeRO-1/2现在按 **每个参数是否在本step窗口参与过backward** 判断
 ZeRO-3 CPU optimizer offload在构造时可pin CPU master，`_copy_pinned_master_to_device`先以master原dtype传设备再cast，并记录event后 **host synchronize**，确保下一forward的独立allgather stream拿到新值。函数里有non_blocking copy不表示这段端到端无等待；NVMe swapper管理的subgroup另走其生命周期。destroy还对构造时pin的master解pin。
 
 checkpoint的FP32 master来源和optimizer状态加载已分开，`load_from_fp32_weights`不再控制Engine完整恢复，见[checkpoint专题](pipeline-schedule-and-checkpoint.md)。这与梯度累积是否保留FP32是两个不同边界。
+
+## 2026-11-18：累积窗口、CPUAdam 与混合 dtype
+
+以下按官方固定 `5420b75de3226e95b6412ed2d95380c0a819c89a` 的已读实现说明；前述 `d8241a9b` 的机制证据保留适用版本，未在本轮运行上游或 HCU 分布式测试。
+
+### ZeRO-1/2 host ownership 与保留设备梯度
+
+`accumulated_grads_in_cpu` 改为按 optimizer group 懒分配的一份 owned partition，首次非 boundary 累积才申请；GAS=1 不为这条 accumulator 另 pin 一份全参数副本。`_offload_unpublished_param_ids` 跟踪最后贡献发生在非 boundary 的参数，boundary 即使没有该参数的 backward，也必须发布其 host sum，供 norm、`safe_get_full_grad` 和 step 消费。回归不能只覆盖所有参数每个 microbatch 都参与的模型。
+
+compact partition 在 boundary 先按本窗口所有参与参数计算 norm、拷到 host，并检查转换后 host dtype 的 overflow；FP32 有限值转成低精度仍可能溢出。只有 host 精确保存该累积值、既有 safety 路径启用且未设置保留时，才释放设备 partition 并将其标为 host-owned；下一次 backward 等 copy 后重建、恢复该累积和。允许精确恢复的条件是相同 dtype，或 FP32 host 保存从 BF16/FP16 扩宽的值，不是任意低精度 host 都可替代 FP32 累积。step/overflow 跳过与重置须清空残留和全部参与 ID。
+
+配置 `retain_gpu_grad_partition_until_step` 默认 False，官方 config 将其描述为 ZeRO-2 CPU offload/FP32 累积的容量与复用取舍；共享实现的实际准入仍要按所用 stage/optimizer 查证。True 会把 compact partition 留到 step，增加该 rank 一份对应 dtype 的 partition 驻留，避免释放后再恢复；**当前 `_offload_compact_grad_partitions` 在检查 True 前已经执行 host copy**，不能照配置注释将其写成消除了每次 D2H。测量请求间恢复、copy、CPU/设备峰值及整体更新，不能仅数 allocation。原有 ready/reuse/record-stream 和 copy 完成保护继续成立。
+
+### ZeRO-3 fused CPUAdam scale 与 BF16 回传
+
+`_grad_scale_for_cpu_adam` 只在 DeepSpeedCPUAdam 的 CPU subgroup、FP32 master/gradient，且无 GradScaler、ZenFlow、NVMe swap、Muon并有原生支持时，把 unscale/clip 因子交给 `step(grad_scale=...)` 在加载梯度时融合。梯度存储本身暂未改写，`_deferred_grad_scale` 必须在下一步 overflow 检查、公开梯度读取/修改等边界，对未被新窗口覆盖的部分补齐；不能绕过这些 API 直接读取旧 raw gradient 宣称状态不等价或删除 bookkeeping。
+
+满足上述条件，且目标设备 partition 为 BF16、`offload_optimizer.pin_memory` 启用、CPUAdam `copy_supported()` 时，`_cpu_adam_step_and_copy_back` 将更新和 BF16 量化写入两个交替 pinned buffer，再分块 H2D。复用一个 buffer 前等它上一轮 copy，最后一次 copy 的 event 在返回前 host synchronize，确保下一 forward 的独立 gather stream 看到新参数。它不是所有 CPU optimizer、dtype 或 NVMe 的通用快路。默认两个 `2**26` 元素 BF16 buffer 在首次走此路径时合计 **256 MiB pinned memory**，与 master、gradient 和通信临时量一起计入主机预算。源码声明保持 FP32 更新与 BF16 舍入契约，需按实际 CPU 指令实现和训练更新做回归；不能用源码声明代替收益或 HCU 数值验收。不满足条件时仍走原 pinned-master copy/cast 和完成等待。
+
+### 保留 FP32 参数、offload 与销毁
+
+`data_types.keep_in_fp32_modules` 从仅 buffers 扩到匹配的 parameters，但 engine 只允许 **ZeRO-3 且无 parameter CPU/NVMe offload** 的低精度模型保留 FP32 参数；不兼容的显式请求硬拒，AUTO 仅告警并保留 buffers。不能将 optimizer CPU offload 与 parameter offload 混为同一条件。相应 FP32 参数用 FP32 通信/累积，参数扁平区、梯度区与 bucket 按 dtype 拆分，all-reduce fetch 也按 dtype 分组。小 FP32-only bucket 的缩容不表示所有 bucket 都可任意缩小，异常后重入 backward 仍有边界。
+
+设备上已为 FP32 的 subgroup 可让 master 与 weight partition alias，动态搬迁必须恢复这个共享身份。`offload_states` 对混合 dtype 的 `lp_params/lp_grads` 明确拒绝；只 offload `hp_params` 也不能释放仍与 `lp_params` alias 的那份设备存储。避免按“FP32 master 一律有第二份”计算收益，或忽略硬拒而把部分状态迁移当成全量 offload。
+
+coordinator 的 release LRU 改为实例缓存，NVMe prefetch 对访问队列的重复参数去重。engine/parameter-offload 的 destroy 清理 hooks、全局 forward stack 与参数 optimizer 反向引用，并限制重复 destroy 误删新 engine 的条目；多次构建对照实验仍需核对实际引用、pending copy 和 pinned buffer 释放，不能靠丢 Python 变量证明内存已回收。
 
 ## 回退与更新
 

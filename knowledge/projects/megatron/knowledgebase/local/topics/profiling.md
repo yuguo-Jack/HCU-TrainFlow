@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 sources:
 - source: nvidia-megatron-lm
   path: megatron/training/training.py
@@ -23,12 +23,49 @@ sources:
   path: megatron/training/config/common_config.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: e8be4ca3cdb981348734ff2aedb1622dfa30f0e69218d1326ebd6d08703321e3
+- source: nvidia-megatron-lm
+  path: megatron/training/training.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: c6fc98b09a21b609b2623eacbb224b8b9c168c840e922dca963ad4b0910e7237
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/multi_token_prediction.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 7fcf8b2dd9f1f42a7a64e947758dc83ebd22f0b9a06e044cef4d29b8e026de78
+- source: nvidia-megatron-lm
+  path: megatron/core/full_cuda_graph.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 061169b2549b5381049a25fdc4a6c07e1040cb77b84432830a3f4e4bc7a83881
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/moe/moe_layer.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: a0841a62332c6b6f0c3345304fa2a946b58074617f2390ac39430f4002956657
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/multi_latent_attention.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 4d08649f45e99d958a416bf28a530976cc83551d61c76fccdb5b656515b8e480
 kind: authored
 retrieved_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 ---
 
 # 训练 profiler 采样与 TraceLens 联动
+
+## 2026-11-18：模型口径、运行配置和额外统计
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+当前 profiler 的窗口、rank 选择和输出继续从 cfg.profiling/cfg.logger 读取；既有 wait/warmup/active 与原始 trace 完整性门槛仍保留。FLOP 统计进一步以解析后的 model config、真实 data/decoder sequence_length 及各 layer 的估计方法构造；THD 使用真实 token 总数与序列长平方和，不能用 position capacity 或 padding 后矩形尺寸替代，也不能把官方软件估算当硬件实测。
+
+MTP per-token 日志的 sums/counts 与新增 embedding 范数投影统计可能改变显示值/统计开销，比较旧版本时先核对是否同一训练目标和指标口径。full_iteration warmup 的 capture stream 与 TE offload 同步 owner 也有推进，首次分配/capture、验证、采集和普通稳态步仍需分别计时；内存缓解或投影候选不能靠 profiler 过程的局部快照验收端到端收益。
+
+### 本节固定证据
+
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/training.py)
+- [megatron/core/transformer/multi_token_prediction.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/multi_token_prediction.py)
+- [megatron/core/full_cuda_graph.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/full_cuda_graph.py)
+- [megatron/core/transformer/moe/moe_layer.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/moe/moe_layer.py)
+- [megatron/core/transformer/multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/multi_latent_attention.py)
 
 ## 抓取窗口
 

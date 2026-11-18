@@ -22,6 +22,8 @@ TrainFlow 的消费方式见[环境检查](../../../docs/environment-discovery.m
 
 作业 `RUNNING` / `STARTING`、环境检查 `PASS` 与训练 step/loss 进展分别验收。恢复交接须核对停止失败分支及全部成员终态，不能因目录迁移就认定旧控制器缺口已解决；具体约束见[训练状态验收](../../../docs/training-state-validation.md)。
 
+容器 SSH 身份、NRE 包边界及当前 Ray 成功分析/重试预算的消费契约见[运维指南](../../../docs/operations.md)；固定源码与版本结论仍从大库读取。环境检查、恢复策略和训练结束分析各自保留归属及失败证据，不把一次状态查询作为整套恢复已经验证。
+
 ## 后续维护
 
 更新时读取[外部知识与用法关联](../external-knowledge.json)，核对大库结论和实际依赖；接口、输出、单位或副作用变化时复核其 `targets` 对应文档、Skill 和解析器。普通查询仅留任务缓存，TrainFlow 更新不自动更新 HCU-Knowledge，也不将 HCU 仓加入本地官方来源。

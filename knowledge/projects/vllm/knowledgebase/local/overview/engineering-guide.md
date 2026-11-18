@@ -10,7 +10,7 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 coverage: reviewed implementation chains and official guides; not all models, backends
   or HCU runtime qualification
 sources:
@@ -62,6 +62,35 @@ sources:
   path: tests/v1/worker/test_gpu_worker_weight_transfer.py
   commit: 25e7c5728d834335288d080e1c36810fa111d4da
   sha256: 6207d97b7673c913ab8210b9723c97675058b998e42a6942617742ff797573ff
+- source: vllm-project-vllm
+  path: setup.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 2ea6cc15d061bba8be1c7ad3f088e3ab6f60cbc6418cf6349ae98c55ae2e9cdc
+- source: vllm-project-vllm
+  path: docs/getting_started/installation/gpu.rocm.inc.md
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: bede087319578b95c2e9768dae8c70dd13700f5a63446191cbb8c560c40353e8
+- source: vllm-project-vllm
+  path: vllm/device_allocator/sleep_mode_backend.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 26f86c753a9eef2e2cbb75b228fc3f05aa59e4546260eef28f3c1b61a25d9316
+- source: vllm-project-vllm
+  path: vllm/v1/worker/gpu_worker.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 75b922226252564f93c4c40c95a59f55ffc799025c63d0901050e3c19663f342
+- source: vllm-project-vllm
+  path: vllm/distributed/weight_transfer/nccl_engine.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 86b91366176e91408cef6dfe5c901fc8cb272dbbfbbc3d0dbfc892a028d94575
+- source: vllm-project-vllm
+  path: vllm/distributed/weight_transfer/sharded_rdt_engine.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 506a36d957652c4735b02e1741cab38fd6d6005ff9ac31d3ed79c72fc390740b
+- source: vllm-project-vllm
+  path: docs/features/sleep_mode.md
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 18549509f4dee4fb2eef008541a634c73a0ad8cbc8ab2199de11032425468b74
+retrieved_on: '2026-11-18'
 ---
 
 # vLLM：RL 权重同步、生成与显存交接的工程地图
@@ -119,11 +148,11 @@ ROCm wheel 另受 Python 和平台变体约束：当前指南仅提供 Python 3.
 
 当前 HTTP health 在一次 weight update 失败后仍可能返回200，而模型已处于中途 reload 状态。消费者必须检查完整 start/update/finish 结果，重新安装可信完整权重后才恢复生成；只补最后一个 chunk 或只修改 version 标签都不能修复这类状态，见[传权专题](../topics/weight-transfer.md)。
 
-本页固定官方main `25e7c5728d834335288d080e1c36810fa111d4da`；2026-11-04 release API 最近记录的名称为 v0.33.0、实际 tag 为 [v0.33.0rc3](https://github.com/vllm-project/vllm/releases/tag/v0.33.0rc3)（2026-11-02 发布，API 标为非 prerelease）。名称、tag 和源码 main 分别保存，不能把 tag 中的 rc 或 API 标志单独当成 HCU 稳定资格。[Releases](https://github.com/vllm-project/vllm/releases)、[官方文档](https://docs.vllm.ai/)、[Issues/RFC](https://github.com/vllm-project/vllm/issues)、[PR](https://github.com/vllm-project/vllm/pulls)共同核对规划、合入和发布。sleep-backend源码引用RFC #34303是扩展动机，不证明所有durable/CRIU backend已实现。
+本页于2026-11-18复核官方main `a2915755bf1dcaf80623e36d079713bfb190c1e7`，保留 `25e7c5728d834335288d080e1c36810fa111d4da` 的历史固定证据；2026-11-04 release API 最近记录的名称为 v0.33.0、实际 tag 为 [v0.33.0rc3](https://github.com/vllm-project/vllm/releases/tag/v0.33.0rc3)（2026-11-02 发布，API 标为非 prerelease）。名称、tag 和源码 main 分别保存，不能把 tag 中的 rc 或 API 标志单独当成 HCU 稳定资格。[Releases](https://github.com/vllm-project/vllm/releases)、[官方文档](https://docs.vllm.ai/)、[Issues/RFC](https://github.com/vllm-project/vllm/issues)、[PR](https://github.com/vllm-project/vllm/pulls)共同核对规划、合入和发布。sleep-backend源码引用RFC #34303是扩展动机，不证明所有durable/CRIU backend已实现。
 
 保留[PR #59772](../../upstream/prs/vllm-project--vllm/PR-59772.md)作为可选ModelExpress依赖/CI测试约束的历史入口；它修测试发现与skip，不能称为训练传权性能提升。相关实现PR需按问题继续`wiki-search-pr "weight transfer layerwise" --engine vllm`，再追head/base和真实调用。
 
-`wiki-update PROJECT vllm-project-vllm`同步[全仓目录](../../upstream/source-map/vllm-project-vllm.md)、[原文](../../upstream/docs/vllm-project-vllm)及讨论；source/factory/transport/worker、模型loader、tests和consumer的train-export必须交叉复核。原文同步完成不等于所有模型或HCU后端验证完成。
+`wiki-update PROJECT vllm-project-vllm`同步[全仓目录](../../upstream/source-map/vllm-project-vllm.md)、[原文](../../upstream/docs/vllm-project-vllm)及重要来源；普通 PR 按问题在线读取。source/factory/transport/worker、模型loader、tests和consumer的train-export必须交叉复核。原文同步完成不等于所有模型或HCU后端验证完成。
 
 ## HCU 使用前的独立核对
 
@@ -145,3 +174,16 @@ HCU 侧若通过 vLLM 插件接入，基础包、插件及算子扩展是不同�
 - [tests/v1/worker/test_gpu_worker_weight_transfer.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/tests/v1/worker/test_gpu_worker_weight_transfer.py)
 
 本页在 2026-11-04 阅读上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+
+
+## 2026-11-18 固定主线复核
+
+以下按 `a2915755bf1dcaf80623e36d079713bfb190c1e7` 实际消费者说明，旧固定证据仍保留其版本范围。
+
+当前统一 GPU runner 的构造与调用链已替代旧 V1/V2 条件分支，实验 CUDA process-checkpoint 不再要求设置旧 V2 环境开关，但 Linux/NVIDIA、cumem、标准 worker、单节点 TP 等资格仍独立存在；不因删除一个旧开关推断 HCU 可用。安装侧的 CUDA13 wheel 变体、CV-CUDA可选依赖和 ROCm FlashAttention 编译目标也有变化，仍按实际平台/制品配对，不自动安装训练推理依赖。
+
+sleep backend 的内部 ABI 已改为 `suspend(discardable storage addresses)`，level2 只丢更新会重写的 parameter storage；其余 load 期普通属性、closure tensor、pointer table 同地址保留，derived weight 状态仍须 post-load 刷新。connector cache 可选择保留，但块 hash 不含权重版本，恢复必须守住 policy/KV 身份，见[显存专题](../topics/memory-and-scheduling.md)。
+
+NCCL 新 `use_load_plan=False` 是显式选项，metadata 在 init 固定、首次 target start 后才 trace，失败可能已改变模型状态；它与 RDT 原 FakeRDTTensor bake/no-fallback 机制分开。RDT 新 host staging 与并行 stage streams 增加精确的 receive-pool、注册及 slot generation 生命周期；成功 init、finish、每 worker hook 与可信 policy 发布依次验收，见[传权专题](../topics/weight-transfer.md)。
+
+固定入口：[setup.py](https://github.com/vllm-project/vllm/blob/a2915755bf1dcaf80623e36d079713bfb190c1e7/setup.py)；[docs/getting_started/installation/gpu.rocm.inc.md](https://github.com/vllm-project/vllm/blob/a2915755bf1dcaf80623e36d079713bfb190c1e7/docs/getting_started/installation/gpu.rocm.inc.md)；[vllm/device_allocator/sleep_mode_backend.py](https://github.com/vllm-project/vllm/blob/a2915755bf1dcaf80623e36d079713bfb190c1e7/vllm/device_allocator/sleep_mode_backend.py)。本轮没有安装、运行上游测试或执行 HCU 训推验收。

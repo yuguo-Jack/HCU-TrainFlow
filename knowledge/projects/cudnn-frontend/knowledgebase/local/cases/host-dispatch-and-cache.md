@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
@@ -34,6 +34,18 @@ sources:
   sha256: cd69f580a94aa1728385008ada47166fc77421373d45f7bedd0fd9b5b106ebc2
   url: https://docs.nvidia.com/cudnn/utilities/framework_integration_performance/
   revision_kind: web-content-fingerprint
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/_pygraph.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: bf17e14d6250b2c85107308d4ee885877ce10fb2d458389754f2af5204d99126
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/gemm/frost/graph_analyzer.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: fd02f3c6c1c384491be9ac592f9fe4b6d1508bbf18b4699d2de947d7faaad0c9
+- source: nvidia-cudnn-frontend
+  path: docs/utilities/python_graph_and_execution_backends.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 71ea0a2933a86945fdafe771e0c37b4f5fbb958722bce80b2868bed0d9e1707b
 ---
 # 案例：cuDNN Kernel 不慢，模型却被构图和 Host 调度拖慢
 
@@ -55,6 +67,12 @@ sources:
 4. 回归动态 shape、并发 stream、参数更新和 checkpoint；检查复用缓存是否错误共享或无界增长。
 5. 若使用 graph 捕获，再测固定地址/RNG/工作区和重放正确性；独立 kernel 计时与真实训练吞吐分别报告。
 
+## 当前缓存命中仍需复核的条件
+
+固定 `623ad8ff498a` 后，Frontend recipe 和编译制品采用不同失效边界：旧 engine/config 不再准入时完整重新 planning，不能改 ID 继续复用。最终 plan 的 behavior note 决定 packed Stats stride override 是否可用，engine 名不能代替能力检查。计时还应保留本次 workspace 容量、Handle 所在设备/stream 及实际绑定；已有 cache 或 Graph 对象不证明这些条件正确。
+
+FROST GEMM 的辅助张量现在保留原存储及逐 consumer 的逻辑 IndexMap，只有全部使用都满足旧 per-K 条件才采用旧辅助 ABI。相同 shape 不足以忽略广播、view、方向与舍入；比较 host 优化时把构图/编译和稳态执行分开，避免缓存了不兼容的语义。
+
 ## 验收与回退
 
 通过条件是数据/梯度契约不变、模型空泡和墙钟改善、缓存与峰值显存可控；单个 microbenchmark 提速不够。遇到 shape/版本/stream 不匹配，应退回已验证路径或重建正确缓存项，并记录原因。该机制可供 HCU TE/Flash-Train 的 Python/C++ 封装优化参考，具体实现仍看目标分支。
@@ -74,3 +92,9 @@ sources:
 - [nvidia-cudnn-frontend-docs: framework-integration](https://docs.nvidia.com/cudnn/utilities/framework_integration_performance/)
 
 本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+
+## 2026-11-18 固定依据
+
+- [python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/_pygraph.py)
+- [python/cudnn/gemm/frost/graph_analyzer.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/gemm/frost/graph_analyzer.py)
+- [docs/utilities/python_graph_and_execution_backends.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/docs/utilities/python_graph_and_execution_backends.md)

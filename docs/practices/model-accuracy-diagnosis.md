@@ -21,13 +21,19 @@
 
 任务先前采用缩层代理时，对照双方必须是同一代理；不能拿全模型和缩层 loss 相比。保留完整目标的未覆盖范围，不为精度排查擅自改 hidden dim、优化器或训练目标。数据敏感时在授权环境内对比，外发问题包使用经核对的脱敏复现，不上传真实样本/权重。
 
+有效 token 不均或动态并行时，核对实际参与的 group、反传 loss sum/分母和日志计数，不能用配置里的 CP/DP 大小或若干微批均值代替。主 loss、MTP 等辅助目标以及日志可能使用不同归一化；全局 token 加权日志也不自动证明反传采用全局辅助 token 均值。配置迁移后保留最终消费者的有效值，具体版本例见[官方 Megatron 工程指南](../../knowledge/projects/megatron/knowledgebase/local/overview/engineering-guide.md)，不能将开发线新机制直接推定为当前 HCU 能力。
+
+路由容量优化也可能改变比较语义。接入 DeepEP cached scatter 或原地 gather 时，分别保存 forward layout/index、有效 token/丢弃映射、routing weight 和展开行的 weight gradient，不能用同名 `topk_weights` 混配。当前 drop-on-overflow 不重新归一化幸存权重；显式启用后须按预先约定的数值/路由契约对照，不能凭吞吐或显存改善放行。来源 README 或特定任务曾接受的精度差异（包括模型大小条件）不构成本任务授权；阈值仍由本任务 oracle 与质量契约确定。接口边界见[通信专项](../../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md#11-数值协议与后端策略必须一起核对)。
+
 ### 低精度状态与 checkpoint 版本
 
 权重 dtype 相同不代表训练状态相同。分别核对 recipe、量化 scale/amax 历史、权重缓存与 optimizer master/state 的所有者和保存范围；恢复后执行相同输入的下一步，比较实际状态更新与输出/梯度。无状态 recipe 的空附加状态可能符合格式，带历史的 recipe 则不能靠丢弃该状态绕过加载错误；状态是否必需须由实际版本的序列化与加载代码判定。
 
 HCU-Knowledge 的 `te-fp8-state-and-recompute` 保留了这种版本差异：TE `main@73dbcf534252`（2.18 开发线）对已识别的 stateless recipe 不再保存/反序列化 pickle 附加状态；DelayedScaling 历史、旧格式或未知 payload 默认可能被拒绝。`NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE=1` 是可信旧 checkpoint 的显式兼容选择，不是通用训练默认，更不能代替 scale/history 恢复后的数值验收。`release_v2.16` 和现场制品需分别查实现，不能由 main 新策略推定其行为。普通模型权重转换往返、完整训练状态恢复和异步写入完成仍是不同检查。
 
-本轮 TE `main@072eca0b863cb19fa39bb6cab67abf0110d4ed0e` 的 `_extra_state.py`、`module/base.py` 与 `quantization.py` 和上述固定证据的 blob 相同，因此保留其状态契约；新增 tensorwise INT8 模拟则让 `Float8CurrentScalingQuantizer` 实际使用 `kInt8`。recipe 名中有 FP8 不等于底层存储采用 E4M3/E5M2，诊断和容量记录需连同实际 quantizer dtype、scale 布局、GEMM 后端及被跳过的组合核对。来源测试定义和软件门控不代替现场精度验收。
+2026-11-04 固定 HCU TE `main@072eca0b863cb19fa39bb6cab67abf0110d4ed0e` 的 `_extra_state.py`、`module/base.py` 与 `quantization.py` 和上述固定证据的 blob 相同，因此保留其状态契约；新增 tensorwise INT8 模拟则让 `Float8CurrentScalingQuantizer` 实际使用 `kInt8`。recipe 名中有 FP8 不等于底层存储采用 E4M3/E5M2，诊断和容量记录需连同实际 quantizer dtype、scale 布局、GEMM 后端及被跳过的组合核对。来源测试定义和软件门控不代替现场精度验收。
+
+量化候选的独立参考先核对公式。与 kernel 共用同一 scale-floor 或舍入辅助函数的 reference 可能复现同一个错误；补全零/极小尺度、特殊值、分组与广播映射的独立预期，再解释误差。融合跨过 residual 重写或行选择时，归一化值、量化缓存/scale 与后续系数也要绑定同一生产者版本和行映射，不能凭形状未变复用。具体实施衔接[数值失败时的算子检查](../../skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md#数值失败时核对实际执行序列)，方法来源见[性能方法](performance-methods.md)。
 
 ## 2. 有 NVIDIA 环境：分层建立跨平台对照
 
@@ -110,6 +116,8 @@ debugger.step()  # 仅正常完成后推进；映射到真实 iteration/microbat
 先验证 shape、dtype、layout、有效区间和语义映射，再看数值。对正常有限张量，按预先声明的 `abs(candidate-reference) <= atol + rtol * abs(reference)` 等契约报告超限比例、最大/均方误差、误差分布及异常坐标；可辅以相对 L2、余弦和幅值分布。接近零的参考值需注明相对误差分母处理，不能只看余弦一个数，也不能忽略少量高幅值异常。
 
 NaN/Inf 单列计数、位置和最早来源。attention mask 等语义允许的 `-inf` 只在已声明边界按模式检查；loss、梯度或更新中的非有限值不可通过 `equal_nan`、删异常样本、夹值或抬高容差掩盖。双零/单零向量和空张量按明确契约处理。阈值来自任务精度要求、参考算法、dtype/累加误差和基线自身重复差异，不照抄工具默认“达标分数”，不得看见候选误差后放宽。
+
+编译参数会影响上述守卫。当前 HCU FlashAttention 的 attnmask 生成目标显式保留非有限数处理（`-fno-finite-math-only`），不能为统一 fast-math 移除此条件；完全不可见 K tile、padding 与边界输入须单独回归。构建移除某两项功能禁用宏也不证明 backward、dropout、ALiBi、softcap 或所有 wheel 同时可用。沿实际目标和 Torch 调用者确认支持范围，固定依据见 [CMake 条件](http://42.228.13.241:10068/dcutoolkit/deeplearing/flash-attention-cutlass/-/blob/dccfebdc402592e83d74163e305b0ace2447d66d/CMakeLists.txt)；本次源码复核不作为硬件精度实验。
 
 混合精度的溢出另核对实际 loss scale、`found_inf`、是否跳过参数更新、scheduler 推进及后续有限值。受控缩放/跳步与坏梯度写入参数不是同一现象；连续溢出、无有效更新或与基线行为不符必须排查。保留原始异常，不把跳步样本改写成正常更新；当前监控的非有限告警仍需解释和处置，不能仅凭“用了动态缩放”消警或放行质量门槛。
 

@@ -6,7 +6,7 @@ engine: cross-engine
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: 480827ef2a4abbc940ed6acc17d81b05fc5b0b0d9dd518363a63f53723cad44b
+generated_body_sha256: ea76ed4b6354c6d2aae5ed31082db3ac8188f67c09b052e0e6ecddd23b1c634c
 ---
 
 # 官方来源与按需查阅
@@ -145,7 +145,7 @@ generated_body_sha256: 480827ef2a4abbc940ed6acc17d81b05fc5b0b0d9dd518363a63f5372
 
 ## yuguo-jack-hyperloom
 
-[官方入口](https://github.com/yuguo-Jack/Hyperloom) · [PR 入口](https://github.com/yuguo-Jack/Hyperloom/pulls) · 登记分支 `main`
+[官方入口](https://github.com/AMD-AGI/Hyperloom) · [PR 入口](https://github.com/AMD-AGI/Hyperloom/pulls) · 登记分支 `main`
 
 - [固定源码阅读入口](../projects/hyperloom/knowledgebase/upstream/source-map/yuguo-jack-hyperloom.md)；按固定 commit 查文件、调用者和测试。
 - [选定文档原文](../projects/hyperloom/knowledgebase/upstream/docs/yuguo-jack-hyperloom/)；保留原版本和适用范围。
@@ -178,7 +178,7 @@ generated_body_sha256: 480827ef2a4abbc940ed6acc17d81b05fc5b0b0d9dd518363a63f5372
 
 ## baidu-loong-megatron
 
-[官方入口](https://github.com/baidu-baige/Loong-Megatron) · [PR 入口](https://github.com/baidu-baige/Loong-Megatron/pulls) · 登记分支 `9d2d6b30f4099ed0e29300f76e19f55b72387ffc`
+[官方入口](https://github.com/baidu-baige/Loong-Megatron) · [PR 入口](https://github.com/baidu-baige/Loong-Megatron/pulls) · 登记分支 `343efbf4029e81697d32f54c6f924ac82b06677f`
 
 - [固定源码阅读入口](../projects/loongforge/knowledgebase/upstream/source-map/baidu-loong-megatron.md)；按固定 commit 查文件、调用者和测试。
 - [选定文档原文](../projects/loongforge/knowledgebase/upstream/docs/baidu-loong-megatron/)；保留原版本和适用范围。

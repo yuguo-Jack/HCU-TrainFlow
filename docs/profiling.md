@@ -47,6 +47,8 @@ Graph、Roofline、原生 Agent、EventReplay、hipprof/pftrace 与 XProf/XCompu
 
 `generated` 表示非空报告生成，不表示优化完成。TraceLens 原生百分比的统计窗口/分母不自动等于 TrainFlow 稳态窗口墙钟；Agent 需结合窗口、process groups 和 shape 证据解释，两套结果不能直接相加。缺失 CPU-op 关联、空表、超时与执行失败都会明确保留。
 
+`tracelens-report --window window.json` 只为显式窗口导出 CPU/GPU 归因，再交 `profile-analyze`；它不裁剪原生 CSV。回执的 `timing_contract` 分开记录原生整份 trace 的首个 GPU 开始至最后 GPU 结束，以及调用方选择的训练窗口。需要只分析某段原生报告时先显式 split 并核对提取范围，不能给整份 CSV 换一个分母就当成窗口报告。collective 即使文件齐全，缺实际 group 或 correlation 绑定仍为 `incomplete`；原生 inference stream-order fallback 不补成训练证据。
+
 训练 Graph 的一次 launch 不等于一完整训练步：fwd/bwd/重算/更新及梯度累积可能分别捕获或重放。capture 只用于恢复调用映射，正式时间来自真实稳态 replay；核对精确图特化、phase、调用序列、参数/地址与 RNG/状态契约。推理 annotation、最近 batch bucket、CSV 非空或 sanity 日志没有报错均不能证明训练映射完整；根/特化未匹配及事件数/耗时不一致保持缺口。具体支持范围以锁定源码和目标 trace 资格结果为准。
 
 采集和诊断也可能改变执行资格：编译支持不等于可 capture，活跃 capture 中的 host event query/synchronize 在某些 runtime 会使 capture 失效。按目标版本使用框架已有的安全观察点；需要改变 Graph 模式定位时，另留有界复现并回到正式模式复验。具体检查见[编译与 Graph](../skills/hcu-train-analyze-and-optimize/references/torch-native-training.md#编译问题的定位顺序)和[通信卡住诊断](../skills/hcu-train-scale-and-stability/references/diagnosis.md)。

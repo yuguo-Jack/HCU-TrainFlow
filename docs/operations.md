@@ -23,6 +23,8 @@ hcu-trainflow --workspace /private/remote watch TASK /private/normalized.jsonl /
 
 首次接管、升级恢复器或改变 launcher/并行布局时，固定实际分支、镜像和启动配置，沿“检测 → 决策 → STOP → 全部旧成员核销 → START → checkpoint 加载 → 连续有效 step”逐段验收。TrainFlow watcher、独立 sentinel、Agent 和预检工具提供观察或诊断；训练动作仍归已有的唯一恢复 owner。远端执行超时或控制端失联后，先按[远程执行核销](remote-execution.md)检查原操作，不能因客户端退出或控制器状态改变就重新派发。
 
+推理数据面、路由服务和训练控制面可能使用独立凭据，健康检查/普通 API 成功不能证明 pause、memory release 或 weight update 已获授权。升级时核对实际服务版本、控制路由、所用凭据类别、HTTP 响应体及最终业务状态；403 按权限结果处理，HTTP200 携 error 也不是成功，timeout 后先核销真实执行。当前官方 SGLang 与两个 RL 客户端的具体接线缺口见 [AReaL 控制面](../knowledge/projects/areal/knowledgebase/local/topics/async-version-and-recovery.md#sglang-控制面凭据与版本边界)和 [verl 控制面](../knowledge/projects/verl/knowledgebase/local/topics/weight-cache-and-checkpoint.md#sglang-控制面凭据与版本边界)；它们不自动改变现场部署锁，也不授权盲重放权重更新。
+
 恢复能力必须绑定实际包和 launcher。Megatron Bridge 官方固定 `41af2dcf0dfd83c8933f588bb871b7f56dbd4368` 的说明已区分 NVRx in-process 与 `ft_launcher` 的 in-job restart：前者自 NVRx v0.6.0 弃用，v0.6/v0.7 release 仍含旧 API，上游 main 在 v0.7.0 后移除；不能以“安装最新版”保留旧入口。新部署建议的 `ft_launcher` 也受其 Slurm、checkpoint 和平台条件限制，不能直接视为 HCU 已支持。现有站点继续使用已验证的固定版本及唯一 owner，升级时核对配置、停止范围和恢复验收；细节见 [Bridge 恢复专题](../knowledge/projects/bridge/knowledgebase/local/topics/bridge-checkpoint-recovery.md)。
 
 Cluster Manager 的预检、裸机/Slurm/MPI/Docker 恢复和 K8s operator 分开选择。当前源码与历史差异从[证据入口](../skills/hcu-train-scale-and-stability/references/evidence-sources.md)进入；部署时至少核对：
@@ -32,12 +34,18 @@ Cluster Manager 的预检、裸机/Slurm/MPI/Docker 恢复和 K8s operator 分�
 | 训练恢复入口 | 当前源码子目录为 `hcu-training-reliability/`，import 仍为 `cluster_manager`、console 仍为 `hcu-cluster-inspect`；目录、包名与现场制品分别确认 |
 | MPI 与训练 rank | `--mpi-ranks-per-node` / `MPI_RANKS_PER_NODE` 描述每节点 MPI 进程数，训练 `--slots` 描述 GPU worker 布局。MPI 每节点只起一个 torchrun 时两者不同；按实际 host 顺序和 rank 映射核对，未知、非均匀或重排布局不得按 slots 猜节点 |
 | Docker 启停 | 核对宿主 clush 准备、首计算节点单次启动、容器内 MPI 传播及替补容器准备。按进程名停止可能涵盖专属容器内其他 Python；空 hostfile 的成功不能证明失联旧成员已退出 |
+| 容器 SSH 身份 | 每个新容器生成自己的受管密钥，私钥留在该容器；宿主经已认证连接交换公钥/容器 host key。不得挂载或链接宿主 `.ssh` 来补连接。核对受管 authorized_keys 块、独立 known_hosts、严格 host-key 校验、准备命令的逐节点失败与替补节点准备；连接预检不证明训练通信或节点健康 |
+| 可选 NRE 适配 | 仓库子工程 `nvidia_resiliency_ext/`、适配 import `hcu_resiliency_ext`、上游 import `nvidia_resiliency_ext` 分开。父 gitlink、包装器依赖约束、组合 wheel 实际版本及 launcher 兼容各自确认，不以能 import 或跳过 CUPTI 扩展推断全部 CUDA 依赖/恢复链已可用 |
 | NHC 与节点重入 | 核对检查在 host 还是 container 执行、实际权限和有效结果。无有效指标、缺标记、检查命令失败均保留缺口；K8s Ready 不足以解除隔离，只按原协议操作本 owner 管理的状态 |
 | envcheck 计划与重跑 | `--dry-run`、预检 PASS、载荷 PASS、清理 CONFIRMED 分开验收。保留完整结果目录、`.state`、原始组日志、参与/未参与节点和实际设备；`cleanup-unconfirmed` 时先核实原 run，不能从另一 token 重跑掩盖未决进程 |
 
-特别注意：固定 `1e54471b5b0f4e8401596f519b9632c5de8cff11` 的 `distributed_job_manager.py::_stop_training` 仍在三次停止失败后转入 `STARTING`。这个实现状态不是旧进程已结束的回执，不满足本流程“全成员 STOP 核销后才 START”的要求。拟采用该恢复器时，由同一个站点 owner 核对该分支的实际停止范围和失联处理，完成适用配置或修复及回归后再验收；未完成前保留部署缺口，不让 Agent 再增加一个竞争恢复器。本文不宣称上游或现场已经修复。
+特别注意：固定 `ea2a1d1e95f3c524bcf1fdf74d382ec351ea8e3b` 的 `distributed_job_manager.py::_stop_training` 与此前 `1e54471b5b0f4e8401596f519b9632c5de8cff11` 的保留原件字节一致，仍在三次停止失败后转入 `STARTING`。这个实现状态不是旧进程已结束的回执，不满足本流程“全成员 STOP 核销后才 START”的要求。拟采用该恢复器时，由同一个站点 owner 核对该分支的实际停止范围和失联处理，完成适用配置或修复及回归后再验收；未完成前保留部署缺口，不让 Agent 再增加一个竞争恢复器。本文不宣称现场已经修复。
 
 Primus-SaFE 接管也要区分平台部署、实际 leader、训练任务与告警组件。node-agent、analysis、notification 各自的 Deployment/镜像和真实消息送达需独立留证；stdout 日志管线不保证采到容器文件日志，节点资源图也不等于任务独占用量。RayJob 的统一重启预算、旧 UID 收尾与 deployment 终态按该分支核对，不能套普通 Workload 的重试计数或用同名新对象替代旧作业核销。
+
+对启用成功复核的 RayJob，原生 `SUCCEEDED/Complete` 只是待核对输入。按实际部署协议匹配 Workload UID、RayJob UID、dispatch、最终原生 attempt/submission 与重试计数；分析结果须排干日志、封存并完成事务，且具有版本和布尔故障判定。旧 attempt 结果、未提交事务或 API/权限错误不能当作 clean。分析 CRD 未安装的可选回退与已安装但 Session 缺失/未完成的等待分支分别核对；不要用清除 annotation/Session 或创建第二恢复器跳过等待。分析确认故障时的 fallback 与原生重试、停滞恢复共享同一个持久预算，不再附加一轮。当前示例 `maxRetry: 0` 关闭重启；预算调整是任务恢复策略，不能由示例存在推断已经启用。
+
+升级前另核对安装脚本和实际 Deployment。空 `IMAGE_ARCHIVE_DIR` 表示跳过归档检查/导入，使用现有镜像，不能据此证明节点镜像一致；显式指定目录才进入归档加载。已有 release 的升级、当前 leader 与运行二进制仍需单独验收。NRE telemetry 也独立验收：显式 `NVRX_ENABLE_TELEMETRY=0` 优先于旧 exporter 配置，开启但依赖缺失会回退上游 profiling；导入成功不能证明 HCU telemetry 已接管。上述源码边界及固定入口见[证据入口](../skills/hcu-train-scale-and-stability/references/evidence-sources.md)，本轮未做集群或恢复实测。
 
 ## 检测与记录
 

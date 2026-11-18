@@ -10,8 +10,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: fixed delta and actual rollout/training/recovery consumer review; no HCU runtime validation
 sources:
 - source: inclusionai-areal
   path: areal/infra/staleness_manager.py
@@ -121,13 +121,78 @@ sources:
   path: areal/infra/remote_inf_engine.py
   commit: 27879753c7611fee9a0af6e71a4f838db27b72a7
   sha256: be905076f6f1d3c62bba90b7ece53d329cdd129ebf6fb08f327251e6e88444e0
+- source: inclusionai-areal
+  path: areal/utils/recover.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: b5ef765dda8477b6b1fc971d0919a772975a29fca5d3a43279e96ed34ecc0524
+- source: inclusionai-areal
+  path: tests/test_recover.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: a783135c1a6678e431e5e344188b188d203d85e802874f0a130fd3736918e5b7
+- source: inclusionai-areal
+  path: areal/trainer/rl_trainer.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 214492d9b38266926567743f834f1ae74b2bda672fdf1dabf79c5a02d55e7886
+- source: inclusionai-areal
+  path: areal/v2/training_service/controller/controller.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: a5769afffb3266a6223eefa3a5cbef67afdf1ca227b2bfa710c36c300a3497cb
+- source: inclusionai-areal
+  path: areal/infra/controller/rollout_controller.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 2e2c2c042c173ec7283c22e8a185d33b46fa5aa8f46f79511beb304b94fdf5bc
+- source: inclusionai-areal
+  path: areal/infra/remote_inf_engine.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 7f37ad6a9d397a1c518ef9dbf63b8d4df97cc11e977bc28a89ea46b4a9ab04da
+- source: inclusionai-areal
+  path: areal/infra/backend_router.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 629d646820cc3c6496c4deb54920653f5fd3cd4f9f898f69906d51efa7a40a36
+- source: inclusionai-areal
+  path: areal/v2/inference_service/router/client.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: a50dc775a931539c485dd1824939c2b6c7f6fe7ebc9d985805641c544372976d
+- source: inclusionai-areal
+  path: areal/api/cli_args.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 33f21c95db99a9a19d4ce04fe71b8815463ee1f6652e0b1a8669d52e39b190a6
+- source: inclusionai-areal
+  path: areal/engine/megatron_engine.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: 07564619f0844ed02627defcb408afbc162f2d9dd4fb8ed5ce72ca0c4d0d3681
+- source: inclusionai-areal
+  path: areal/utils/mtp_checkpoint.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: b88d3d8d04b40e92c228daef8ecd520558f3d094aa43d5b1f52720cc09e3940a
+- source: inclusionai-areal
+  path: areal/infra/utils/http.py
+  commit: 7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e
+  sha256: d30148e7225347927c5cfb0de0176f522cd3e295904a35c4a7348dc40486002f
+- source: sgl-project-sglang
+  path: docs/docs/advanced_features/sglang_for_rl.mdx
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 913fc4f4726b9ff0160fe66e2d3bd06fca561c780ddc378c0b29d80fac16c05a
+- source: sgl-project-sglang
+  path: python/sglang/srt/entrypoints/http_server.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 4f12b6f21438c4493a122fc940c14ba275f11e9778bf211731c6a623327e88b9
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 523c96a107548ce1b3871b5fe8191faa797085225030acbb9e3839ff4cac4fcd
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth_levels.json
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: ecb5585cdf47c833231e44daf0355ef20ea7ab2583d171f95569359a99623ce1
+retrieved_on: '2026-11-18'
 ---
 
 # 异步 admission、版本和恢复
 
 ## 问题与链路
 
-异步 rollout 与训练并行会产生版本差。训练速度下降、reward 变慢或恢复后版本跳跃时，单纯提高推理并发可能扩大积压。2026-11-04 本专题以官方 `27879753c7611fee9a0af6e71a4f838db27b72a7` 区分 **提交容量、请求实际版本、权重发布和 durable checkpoint**，它们不是同一个计数。
+异步 rollout 与训练并行会产生版本差。当前固定 `7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e`；提交容量、请求实际版本、权重发布和 durable checkpoint 仍是不同计数。旧 `27879753` 的 admission 公式和未变恢复指针保留原固定证据，下面明确本轮改变的失败分支和新 routing owner；没有执行 HCU 集群恢复。
 
 ```text
 workflow enqueue → StalenessManager 判断提交容量 → 推理/奖励
@@ -167,7 +232,7 @@ quality metrics现在随task result穿过预取/远程RPC，在消费者取出�
 
 [`RLTrainer._update_weights_and_publish_version`](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/areal/trainer/rl_trainer.py)先等待 `actor.update_weights(meta)` 返回，然后给 actor、critic、rollout、eval rollout 发布同一个版本。版本命名取 `global_step+1`；请求的版本信息应来自**实际提供服务的权重**，不是任务排队时或返回时的全局值。`test_rollout_version_race.py` 专门检查这个竞争条件。
 
-v2 还有实际成功门禁缺口，不能把上述函数“返回”理解为权重安装成功。固定实现中，weight-update gateway 捕获传输异常后仍以 HTTP 200 返回 `WeightUpdateResult(status="error")`，不会推进它的 `pair_info.last_version`；客户端仅检查 HTTP 状态并返回该结果。`GatewayTrainController.update_weights` 当前没有检查 `result.status/error`，便继续 generation 并返回，上层 `RLTrainer` 随后可能发布新版本。因此应同时核对更新结果、gateway/worker 实际版本与新权重 logprob；错误结果不能作为继续使用该版本的依据。HTTP/RPC 直接抛异常时的路径又不同。这里记录源码中现存的限制，没有在上游修复或做设备失败注入。
+v2 的正常次序已变为更新返回→`rollout.set_version(meta.version)`→finally `continue_generation()`，使恢复的请求先看到新版本。但成功门禁仍有缺口：gateway 传输异常可 HTTP200 返回 `WeightUpdateResult(status="error")`，客户端仅检查 HTTP，`GatewayTrainController` 仍不检查该业务状态；set_version 抛异常时 finally 也尝试恢复生成。因此次序修复不能证明实际权重已安装，必须核对结果状态、gateway/worker version 与同权重 logprob。这里记录固定源码限制，未修改上游或做设备失败注入。
 
 Rollout controller 的 admission pause 与推理 engine 的 `pause_generation` 是两个层次。v1 AWEX colocated 转移中，reader 的更新事件循环依赖 engine 已 pause；权重安装清空旧缓存后还要 `abort_all_requests`，不能把旧请求 KV 与新权重继续混用。
 
@@ -189,6 +254,20 @@ AWEX plugin在receiver初始化读取 `frozen_visual_embeddings is True` 的积�
 
 colocated SGLang现在显式保留传入的 `_awex_transfer_rank_base`。未提供时，已隔离设备命名空间使用logical base0但保留controller密集传输offset，未隔离环境则跟随解析出的实际worker placement，而非假定controller枚举等于Slurm local order。设备ID与通信rank是两个身份，跨节点/多实例重新接管要分别核对。新disable_prefill_cuda_graph字段默认None以省略flag，只有目标SGLang支持该flag时才使用，不能借此解除现有version allowlist。
 
+### 可选 backend routing 的执行与恢复边界
+
+`backend_routing.enabled` 默认关闭，仅 v1 single-controller + RemoteSGLangEngine 可启用；评估可共享 owner 的物理池，但 controller 成员的 active/sender 状态分别维护。rollout version 写入 router pool；每次真实执行使用 lease 中的 weight_version，生成直达该 lease 的 backend。现有 DataProxy owner 路由和 StalenessManager admission 仍是独立机制。
+
+权重发布暂停顺序是 PAUSED pool→fence 所有相关 sender/dispatcher→drain outstanding lease→native pause。drain 重复 abort-only 请求以处理 fence 前已经在途的晚到请求，排空前保持 native admission 可处理它们；先 native pause 会把晚到请求困在 resume gate。恢复须 health check、正确 control_seq 和真实版本，train/eval 互斥使用共享池。metadata 重试复用 request identity，但真实 generation 不因此重放。
+
+RouteClient 在 timeout/断连/5xx/无法解析终态时不能证明 backend 已停止，不减 lease，而是独立控制通道标记 FAILED 并抛 EXECUTION_UNCERTAIN；失败状态无法确认时也不能假装池健康。暂停不耗 backend-unavailable 的健康预算，连续无可用 backend 超时另有门限；不能把两种等待混为调大 generation timeout。服务的失败要求重启整个 experiment；外部共享 Router 不随任务销毁，旧进程停止须另有确认才能 CLOSED，scheduler cancel 返回不足为证。实际恢复仍交唯一 owner 和现场验证。
+
+### SGLang 控制面凭据与版本边界
+
+SGLang 当前固定 `78b8523` 把 pause/continue、memory release/resume、weight update/group/version 等列为独立 admin endpoints：需服务配置 admin key，控制请求携相应 Bearer；普通 api-key 不解锁；auth_levels.json 的 admin_force 在未配置 admin key 时返回403，已配置但缺失/错误 Bearer 返回401，health 成功不验证该权限。这个访问契约只代表该固定官方版本，不是现场 HCU 服务已升级；参见[固定 RL 控制文档](https://github.com/sgl-project/sglang/blob/78b8523f77ea6b930d065c9dd128a97b222a35c9/docs/docs/advanced_features/sglang_for_rl.mdx)。
+
+已读 AReaL `7fb167a3` 的 RemoteInfEngine 与 `arequest_with_retry`：控制请求自行建立没有默认 auth headers 的 ClientSession，helper 不接收 headers/admin-key 参数，pause/offload、disk/distributed weight update 均未传 SGLang admin Bearer。BackendRouter/agent proxy 自己的 admin key 是另一控制域，不能作为 SGLang 授权已接通的证据。与上述新服务版本直接组合存在实际适配缺口；保留既有 SGLang allowlist 和部署锁，升级必须先接通控制面凭据及结果核销，不能把403包装成网络故障、单纯增加重试或盲重放权重更新。
+
 ## 3. 共享显存：保存、转移与重新接纳的次序
 
 一般循环在改参数前等待 checkpoint staging；v1 AWEX colocated 将训练保存移到 weight transfer **之前**，此时 actor 已 onload，避免后续恢复 actor 权重与推理 KV、转移暂存、TP all-gather 保存瞬态叠加。其他模式仍按自己的时序保存，不能把这条局部优化推广成所有引擎一律前置保存。
@@ -201,7 +280,7 @@ colocated SGLang现在显式保留传入的 `_awex_transfer_rank_base`。未提�
 4. 确认版本，丢弃旧请求，恢复 graph/KV 与生成。
 5. 全流程成功才重新开放 admission。
 
-缺少 tag-aware offload/onload、pause_generation_sync 或 abort/continue 的 engine 会被拒绝。恢复失败后 colocated 请求保持暂停，不能在 `finally` 里无条件 resume。非 colocated 更新路径的失败语义不同，应读实际分支而不是套同一处理。
+缺少 tag-aware offload/onload、pause_generation_sync 或 abort/continue 的 engine 仍被拒绝。当前 RecoverHandler 在**任何** inference engine 已 pause 并开始恢复/发布之后，只有更新和所需生成恢复步骤全部成功才 resume admission；分离式 disk/AWEX 失败也保持暂停并抛错，不再回到训练或在 finally 无条件开放。`test_recover.py` 对应分离式失败断言已改为 resume 不被调用；这项上游测试阅读不等于本机恢复通过。
 
 ## 4. 什么 checkpoint 才能作为恢复入口
 
@@ -215,7 +294,13 @@ FSDP 的训练 checkpoint 另有 scheduler 状态边界：`with_optim=True` 在 
 
 SPMD/多 rank 路径仍使用 legacy 恢复布局；其 dataloader 状态按 rank 聚合，加载时要求 world size 与状态数量相符。不能因此宣称任意 DP/TP/PP 拓扑改变都可恢复。
 
-训练侧activation释放同样要遵守消费者边界：weight-residency路径在forward/backward范围跟踪TE/MCore activation，完整backward返回后才release；nested recompute保护外层输入/grad和返回tensor，异常discard不resize。`ActivationStorageTracker.release`会按storage指针去重并保护参数/buffer别名，不是checkpoint持久状态，也不能移到仍有backward消费者之前以降低表面峰值。固定 `27879753c7611fee9a0af6e71a4f838db27b72a7` 的checkpoint_pointer/recover和v2 status消费者未改，保留下列恢复限制。
+训练侧activation释放同样要遵守消费者边界：weight-residency路径在forward/backward范围跟踪TE/MCore activation，完整backward返回后才release；nested recompute保护外层输入/grad和返回tensor，异常discard不resize。`ActivationStorageTracker.release`会按storage指针去重并保护参数/buffer别名，不是checkpoint持久状态，也不能移到仍有backward消费者之前以降低表面峰值。本轮 checkpoint_pointer 与 activation tracker 未变，recover 的失败开放范围和 v2 发布次序已按上文新消费者修订；以下未变的 v2 恢复门禁继续保留。
+
+### 冻结 MTP 的 HF 导出不能代替训练状态
+
+Megatron 在训练侧丢弃 MTP head 后，非 LoRA 的官方 Megatron-Bridge HF 导出现在尝试从**初始化 Bridge 解析到的本地源目录**补回原冻结 MTP；base_model_path 只选择 assets，不能替换权重 provenance。helper 只支持 qwen3_5/qwen3_5_moe/qwen3_next：检查实际 safetensors header/offset、重复 key 与源 index，分块复制原 dtype 的 mtp.*，恢复 MTP config 并按实际文件重建 index。源与目标目录必须不同，缺/部分/冲突的 MTP 或空 backbone 拒绝；不支持家族才沿旧 scrub/index 路线。
+
+这是推理 HF 产物完整性措施，没有创建训练侧 MTP head，也未改变 DCP optimizer/data 恢复格式。已有目标 tensor 的 dtype/shape 检查不等于全参数数值核对，输出重新加载与当前训练 backbone 的一致性仍需验证。
 
 ## 5. 已明确的限制、验证与诊断
 
@@ -236,3 +321,18 @@ SPMD/多 rank 路径仍使用 legacy 恢复布局；其 dataloader 状态按 ran
 - [areal/v2/weight_update/controller/controller.py](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/areal/v2/weight_update/controller/controller.py)
 - [areal/v2/training_service/controller/controller.py](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/areal/v2/training_service/controller/controller.py)
 - [areal/engine/awex/plugins/sglang_plugin.py](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/areal/engine/awex/plugins/sglang_plugin.py)
+
+
+## 2026-11-18 固定消费者
+
+- [areal/utils/recover.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/utils/recover.py)
+- [tests/test_recover.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/tests/test_recover.py)
+- [areal/trainer/rl_trainer.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/trainer/rl_trainer.py)
+- [areal/v2/training_service/controller/controller.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/v2/training_service/controller/controller.py)
+- [areal/infra/controller/rollout_controller.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/infra/controller/rollout_controller.py)
+- [areal/infra/remote_inf_engine.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/infra/remote_inf_engine.py)
+- [areal/infra/backend_router.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/infra/backend_router.py)
+- [areal/v2/inference_service/router/client.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/v2/inference_service/router/client.py)
+- [areal/api/cli_args.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/api/cli_args.py)
+- [areal/engine/megatron_engine.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/engine/megatron_engine.py)
+- [areal/utils/mtp_checkpoint.py](https://github.com/areal-project/AReaL/blob/7fb167a30e04c9cda1c4dcd6eb88276a2c3d935e/areal/utils/mtp_checkpoint.py)

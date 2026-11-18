@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/models/common/linear/inplace_wgrad_accum.py
@@ -42,6 +42,18 @@ sources:
   path: tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 999896227598f0af578966cb1b968f34a45e8b25dadd16568d26055a1600c35e
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/linear/linear.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: feda76239d93cb5b90422663b188cf228c124f7716dac99accefe24a64f64db3
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/linear/async_linear.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 42e17a54c0a4e8576d3107186e8394d6905194900a92afd2c12d3f051f3e2534
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/pipeline_parallel.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 115833c627aaeaed1ca47e1fe8615183bb2316a738d5587fa6d31fa74507f13d
 pr_sources:
 - pr-pytorch--torchtitan-5137
 - pr-pytorch--torchtitan-5250
@@ -80,11 +92,11 @@ HCU 的借鉴点是减少大 dW 临时量和重复显存读写，同时保留 au
 
 ## 当前提交的保留结论
 
-本次核对 `linear.py`、`inplace_wgrad_accum.py` 与 CPU/GPU WGRAD 回归，引用文件的内容未变：首个 WGRAD 直接产出 grad_dtype、后续原地累积、owned buffer 和 PP 分离 dI/dW 禁用条件继续成立。相邻引擎改为 accelerator-graph API，PP prepare 已接收四项与首个 loss kwargs；这修复调用链缺口，没有改变本案例的梯度舍入和所有权契约。仍未在本轮运行上游设备测试。
+本次核对 `linear.py`、`inplace_wgrad_accum.py` 与 CPU/GPU WGRAD 回归，该版本对应 helper/首个 WGRAD 实现与直接回归未变：首个 WGRAD 直接产出 grad_dtype、后续原地累积、owned buffer 和 PP 分离 dI/dW 禁用条件继续成立。相邻引擎改为 accelerator-graph API，PP prepare 已接收四项与首个 loss kwargs；这修复调用链缺口，没有改变本案例的梯度舍入和所有权契约。仍未在本轮运行上游设备测试。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/models/common/linear/inplace_wgrad_accum.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/linear/inplace_wgrad_accum.py)
 - [torchtitan/models/common/linear/linear.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/linear/linear.py)
@@ -96,3 +108,11 @@ HCU 的借鉴点是减少大 dW 临时量和重复显存读写，同时保留 au
 
 - [PR #5137：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5137.md)
 - [PR #5250：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5250.md)
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+当前 inplace helper 与 CPU/GPU 直接 WGRAD 回归内容继续相同；Linear 的变化发生在 GroupedLinear 新 `scores_R` 入参及输入端评分，不改变本案例 `_LinearFunction` 的首个 grad_dtype 输出、后续累积与 owned-buffer 规则。Async Linear 新增 dense-SP 关闭时的普通路径回退，PP 的 split_module 只导出改名，原 split backward 的 WGRAD 禁用条件继续保留。保持旧特定 H100 数字与新调用者事实分开，未重跑上游或 HCU 测试。
+
+固定入口：[torchtitan/models/common/linear/linear.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/common/linear/linear.py)；[torchtitan/models/common/linear/async_linear.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/common/linear/async_linear.py)；[torchtitan/distributed/pipeline_parallel.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/distributed/pipeline_parallel.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

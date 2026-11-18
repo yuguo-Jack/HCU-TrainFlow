@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: pretrain_gpt.py
@@ -65,10 +66,58 @@ sources:
   path: megatron/training/config/training_config.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: f774afdab3d9ec71159b9f4d3ec6fff1cf6e5d307eaf52447d6d6af81bef451a
+- source: nvidia-megatron-lm
+  path: pretrain_gpt.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 1ba21dabb7284799ec1e7b2e37475e4037f8940452d6d40615d5eeba049c9a40
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/multi_token_prediction.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 7fcf8b2dd9f1f42a7a64e947758dc83ebd22f0b9a06e044cef4d29b8e026de78
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/transformer_config.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 5470c5ca64aad696089ba9503f588c89d33669df05682d51e0d01bda705ca16e
+- source: nvidia-megatron-lm
+  path: megatron/training/training.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: c6fc98b09a21b609b2623eacbb224b8b9c168c840e922dca963ad4b0910e7237
+- source: nvidia-megatron-lm
+  path: megatron/core/optimizer/distrib_optimizer.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 7cd7504fe893c270938d980aac7268de33b6dc1097755e000759b357efbcef96
+- source: nvidia-megatron-lm
+  path: megatron/core/optimizer/optimizer_config.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 7fee0f488870dbbe1af2047ffa53832736c8804f95b693fa37b16867f07e30a3
+- source: nvidia-megatron-lm
+  path: megatron/training/config/container.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 6fee251020eb4fa1087ea88bdd022b250e2a276910c3f217de8eb49129efd323
 retrieved_on: '2026-11-04'
 ---
 
 # Megatron 训练步：数据、loss 归一化、optimizer与数值诊断
+
+## 2026-11-18：MTP 的有效 token、日志与配置消费者
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+MTP 的运行期 group 随 packed metadata 选择，label/mask roll 必须使用同一组。当前代码在实际 CP group 对 main/MTP 有效 token 计数作两元素 SUM，包含静态 CP>1；默认 per-token 路径先按该逻辑 microbatch 的 main/MTP 比例缩放，再由 finalize 按全局 main token 归一化。它保证 CP 切分不改变权重，但不等于不同 DP microbatch 比例下的全局 MTP-token 均值；`mtp_normalize_loss_by_main_tokens` 是另一目标，不能混为性能等价开关。
+
+per-token 日志累计 loss sums/counts，再在相应 DP/CP group SUM 后相除；legacy 非 per-token 日志仍有平均路径。packed/masked 数据的日志变化可能来自计数口径，需回原始有效 token 和同一目标核验，而不是直接判定数值回归。MTP>1 配合 expert-comm overlap 时仍有 repeated-layer、mixing/full-recompute 等明确限制，不能由单深度通过推广全部组合。
+
+训练/模型/tokenizer/checkpoint/rerun 的多个消费者进一步使用注册 run config，改 args 后须核实实际 owning section。新增可选 `embedding_min_norm` 是 optimizer update 后对非零低范数 embedding 行做投影，改变训练更新，不是单纯日志优化；它要求 distributed optimizer，拒绝 optimizer graph/CPU offload，零行不凭空造方向。采用前需冻结目标、数值/状态基线并比较阶段 loss，未启用时不改变原任务。
+
+### 本节固定证据
+
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/pretrain_gpt.py)
+- [megatron/core/transformer/multi_token_prediction.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/multi_token_prediction.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/transformer_config.py)
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/training.py)
+- [megatron/core/optimizer/distrib_optimizer.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/optimizer/distrib_optimizer.py)
+- [megatron/core/optimizer/optimizer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/optimizer/optimizer_config.py)
+- [megatron/training/config/container.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/config/container.py)
 
 ## 从 batch 到参数版本
 

@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
@@ -66,7 +66,28 @@ sources:
   path: transformer_engine/pytorch/quantization.py
   commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 99bc9f487e38d5b1f43f8ec5a2c4b252af9ef4f8f0e75443d8fee32fce90a08b
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/ops/fused/grouped_mlp.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 244df5eb49c4c1d4d87e91e677c1b2971dbe73fe4633ba658aa60d5f40b87f7d
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/ops/basic/grouped_linear.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: b4a247d1ae12908ccadea0f8ad31a238c835f236d6677521585e23874953d518
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/module/grouped_linear.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 38bb48be0c5a598665af593da141274585babc58fe5c53c5409b4a16724c0c59
+- source: nvidia-transformerengine
+  path: tests/pytorch/test_grouped_mlp.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 3881862a0b4f56f0a74dc9a5d1ed7ffaa4839ff8772623e77eac90f01af9ccc0
+- source: nvidia-transformerengine-docs
+  path: op-fuser
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: 6749bdf5190d81e02d9fee350e5783da0e6ba194abadecdcf917ae49e820d790
 ---
+
 # TE 融合与形状级分析：OperationFuser 和 GEMM 教程
 
 ## 两种组织方式
@@ -77,7 +98,7 @@ TE 的模块式接口如 LayerNormMLP 将多个操作封装在一个类中；`te
 
 ## Grouped MLP 的当前准入与参数重置
 
-在 `eb3c860a4d33`，GroupedLinear→scaled activation→GroupedLinear 的融合先检查真实操作序列和 recipe，再探测设备/后端，避免无关 `Sequential` 在 tracing 时触发能力查询。MXFP8 的反向仍要求 E4M3，HYBRID/E5M2 不准入；NVFP4 的 graph-safe grouped quantization 要求 RHT，CustomRecipe 需明确启用对应能力。前后两个 ops.GroupedLinear 声明的 `split_alignment` 都须被256整除，不满足则告警跳过融合。
+在历史固定 `eb3c860a4d33`，GroupedLinear→scaled activation→GroupedLinear 的融合先检查真实操作序列和 recipe，再探测设备/后端，避免无关 `Sequential` 在 tracing 时触发能力查询。MXFP8 的反向仍要求 E4M3，HYBRID/E5M2 不准入；NVFP4 的 graph-safe grouped quantization 要求 RHT，CustomRecipe 需明确启用对应能力。前后两个 ops.GroupedLinear 声明的 `split_alignment` 都须被256整除，不满足则告警跳过融合。
 
 `NVTE_CUTEDSL_FUSED_GROUPED_MLP` 已弃用：兼容读取会将 split alignment 覆盖为256并告警；当前接入应显式声明实际分片对齐，不能只设环境变量当作数据已满足条件。native GroupedTensor 的单参数权重/偏置还受设备、dtype、recipe 和功能组合约束，不能在不支持时静默拆回离散参数。`Sequential.reset_parameters()` 会清 `_module_groups` 再逐模块重置，避免 fuser 持有已经被替换的旧参数。
 
@@ -88,6 +109,10 @@ TE 的模块式接口如 LayerNormMLP 将多个操作封装在一个类中；`te
 新 `GroupedMLP_CuTeGEMMGLUBf16` 是独立未量化路线：仅 recipe=None、BF16 权重/计算、受支持 GLU 和匹配的 SM10.x（minor<7），并探测 cuDNN Frontend 版本及 canonical-layout 能力。每专家和总 token 对齐均为256；FC1 scale_bias、不匹配的分布式权重组合、部分确定性梯度要求均有拒绝条件。当前 matcher 尚直接对 `split_alignment` 取模，未像 block-scaled 路线先解析 None；静态调用链显示匹配窗口在能力门通过后可能因省略该参数而失败。接入时显式声明真实对齐，保留默认参数的准入回归待验证，不将此源码观察写成本轮 GPU 重现。
 
 分布式权重还需保存该次 forward 的 quantizer：backward 重新 gather BF16 shard 后按所保存 recipe 量化，不能从已被后续 forward 替换的 live op 读取。wgrad 的 dtype、外部 main_grad alias、独立结果与 reduce-scatter 分别核对；延后 wgrad 已改为跨 tied 参数和 microbatch 累加，不能覆盖前一贡献。
+
+固定 `8e89d3ad8b2c` 已将 block-scaled grouped MLP 的最低 cuDNN Frontend 提高到1.31.0，并按 wrapper 签名分别探测 runtime offsets 等能力；旧张量格式转换 helper 不再是当前调用入口，布局仍须沿实际 grouped data/scale 和各方向 wrapper 验证。
+
+BF16 路线最低为1.32.0，还要求 fprop、activation、dactivation、wgrad 四个 wrapper 均声明 `supports_bf16_canonical_layouts`；版本字符串单独满足不够。设备仍限 SM10.x 且 minor<7，token/split alignment 仍为256，SwiGLU 与匹配 alpha/clamp 的 GeGLU 分别准入，dprob 原子累加仍拒绝 deterministic。现有显式对齐与默认 None 的 matcher 观察继续按该固定代码保留。分布式权重在 forward/backward 使用前重新 materialize，packed 与逐专家权重通过不同入口传递；保存的 recipe、跨 microbatch 的 main_grad 累加和 wgrad 生命周期仍逐项核对。
 
 ## 官方 GEMM profiling 教程怎么用
 

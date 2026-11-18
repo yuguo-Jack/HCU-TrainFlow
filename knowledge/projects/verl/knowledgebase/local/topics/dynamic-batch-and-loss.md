@@ -10,8 +10,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: fixed source delta and current V1/backend/restore consumers; historical evidence retained; no HCU runtime validation
 sources:
 - source: volcengine-verl
   path: verl/utils/seqlen_balancing.py
@@ -77,6 +77,43 @@ sources:
   path: verl/workers/engine/megatron/transformer_impl.py
   commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: 405dcf1962348a774efa006a08fe13176199fd5fcae1cf4e98b3cfb507b62cff
+- source: volcengine-verl
+  path: verl/trainer/ppo/v1/trainer_base.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: f96ea47392927d1f870b0f382492addafa6d359b8e4ecb9c8395384da8c9e74d
+- source: volcengine-verl
+  path: verl/trainer/ppo/v1/utils.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: c31bbd8f672a60d06654f59e65a7a056ff14e9727094782003f503bf7ec3fc91
+- source: volcengine-verl
+  path: verl/models/mcore/model_forward_fused.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: e60166a36093f94232f45949b6cca0170540a0b51f3be15729aede02700cd971
+- source: volcengine-verl
+  path: verl/models/mcore/util.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: 8b5457da36f2e11c149417117a01e4b71a9e8edc31434bbd8b656af0928dc602
+- source: volcengine-verl
+  path: verl/utils/kernel/linear_cross_entropy.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: 47efd14d77836f37b4f1907cc981f54d321b7978662d16640d11d51bc43219d6
+- source: volcengine-verl
+  path: verl/workers/engine/fsdp/transformer_impl.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: ff7266496cede77ddce70668acdf4c28d6e499a46b996f51fab9e6454a232153
+- source: volcengine-verl
+  path: verl/workers/engine/megatron/transformer_impl.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: f788e47138b7703c443a38ee935f77a4636a03ead24057f08b6d3fb19eacdfe5
+- source: volcengine-verl
+  path: verl/workers/engine_workers.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: eb9d1e40aee0443f85f23b499ee9d34cff15cf39f2d28271b5948fd0952e6175
+- source: volcengine-verl
+  path: tests/models/test_model_forward_fused.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: 90bbd3ce3f49e551f22a459679e1ce6ae133cb32c6809a034ed88c67bb1e3d07
+retrieved_on: '2026-11-18'
 ---
 
 # verl：动态批次的硬 token 上限、GRPO 分组与 loss 聚合
@@ -108,7 +145,9 @@ RL response 长度变化大，固定样本数 micro batch 容易因长序列 OOM
 
 [`compute_grpo_outcome_advantage`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/trainer/ppo/core_algos.py)沿 response token 求总reward，按 prompt index求组内mean/std，再把每sample优势广播回response并乘response mask。单样本组特殊mean=0/std=1，`norm_adv_by_std_in_grpo`控制是否除std。重排不能把group index重新编号为每row或丢掉prompt身份。
 
-`RayPPOTrainer.fit` 的 decoupled 路径重算 π_old，bypass用rollout概率作为old；rollout correction有自己的重要性权重/拒绝统计。省掉一次前向可能改变数值目标；对比同一response的behavior、proximal和current logprob，比只比较最终scalarloss更易定位。
+当前 `b0871fd8` 的 V1 `PPOTrainer._compute_old_log_prob` 在 TransferQueue 上处理 KVBatchMeta：decoupled 每数据 batch 重算 π_old 作为稳定 proximal anchor；bypass 把 rollout_log_probs 写为 old_log_probs。其 rollout correction 只在对应分支使用稳定 π_old；旧 RayPPOTrainer 已删除，不能继续沿旧类名加 patch。省重算仍影响概率来源与校正目标，保留行为/proximal/current 三份 logp 分开比较。
+
+V1 controller 的 `_balance_batch` 先按 DP 及启用的 actor/critic mini-batch×rollout.n 的 LCM 补齐，再按 tags 中 seq_len 估工作量、等行数分到 DP，重排 KVBatchMeta。engine 内的硬 token-budget 切 microbatch 仍是另一层；controller 可补齐不取消引擎“非空 forced group 数不足即拒绝”的条件。对多 trajectory 的 GRPO，实际 `compute_advantage_for_multi_trajectories` 按 `{uid}_{session_id}_{index}` 选择每 session 的最终输出参与基础 GRPO，再把该优势散回同 session 各段并乘各自 response_mask。不能把每段都当独立回答重算组统计，普通非 GRPO estimator 仍走其独立路线。
 
 ## 聚合分母必须与全 batch 匹配
 
@@ -132,7 +171,7 @@ Megatron 开启 `use_fused_kernels` 与 `use_liger`，且满足 BF16 等实际�
 
 native 初始化成功时，legacy DeepEP V1 的 dispatch/combine RDMA allocation hints 若非零会被拒绝，避免另一个 lazy NVSHMEM owner 随后占用同进程；同节点零 RDMA buffer 不被此门控一律禁止。使用兼容 dispatcher 或关闭该 fused head 是明确回退，不能只屏蔽错误。对称 heap/workspace 不随参数、optimizer offload 或推理 sleep 自动释放，须单独计入共卡最高峰值；本轮未做 native/GPU 回归。
 
-`test_megatron_liger_fused_kernels_on_cpu.py` 的 mock 回归覆盖每个 PP/VPP阶段、ref先建而actor容量更大/TP更小、双flag/role/backend门控、optional fallback及只拒绝实际RDMA配置；`test_model_forward_fused.py` 检查 output-processor hook 与旧 patch 的幂等/消费者接线。它们提供局部契约入口，不证明跨节点 DeepEP 与 native Liger 训练可用。
+旧固定 `31cfccb4` 的 `test_megatron_liger_fused_kernels_on_cpu.py` 记录了容量/owner 的 mock 设计，但该文件当前已删除，不能称作当前可执行覆盖。当前 `engine_workers._plan_liger_flsce_capacity/init_model` 与 `_configure_liger_runtime` 的保留消费者仍支持上述固定容量、ref-first 预留和 native owner 规则；新 `test_model_forward_fused.py` 读到 top-k/布局/TP接线断言，没有运行上游测试，不能以文件存在或历史通过推定本轮 native/Liger 集群已验证。
 
 rollout 的 top-k logprob 预算也与执行 batch 分开：当前 schema 不再强制采样 top_p=1/top_k=-1，但仍要求 vLLM、processed_logprobs 与 calculate_log_probs，返回 head 小于采样 top_k 会告警。是否覆盖真实 sampling support 决定后续近似，不能把 topk_log_probs 参数值当作完整分布或修改训练目标的许可。
 
@@ -142,7 +181,13 @@ rollout 的 top-k logprob 预算也与执行 batch 分开：当前 schema 不再
 
 Megatron的top-k distillation processor现显式收到同样的quant_align_size、cp_layout和local_cp_size，使teacher target沿student的THD/CP排列，不能只按张量长度碰巧相同来对齐。`test_model_forward_fused.py` 已相应检查传给preprocess的数值16；本轮未执行设备/蒸馏回归。
 
-`linear_cross_entropy` 的范围标记改由platform.nvtx_range提供，数学分支及Liger固定容量owner没有随之改变；`seqlen_balancing.py`、core_algos聚合和原loss/预算测试的文件哈希也未变。因此保留本页硬token上限、forced group和全batch分母合同，重新测量新增padding/量化workspace，不能把框架标记接口更换当成计算性能改进。
+本轮 `linear_cross_entropy` 数学分支确有新增，不能只当范围标记变化。TileLang 入口当前检查 hidden.device.type 为 cuda 且 reduction='none'；普通 Triton/Liger 若 label 数不等于 token 数则拒绝。fused top-k 将 policy label 与 teacher/rollout head labels 拼到最后一维，由支持的后端返回 policy/top-k logp，辅助 processor 在 THD postprocess 前消费；缺返回值或 processor 明确报错。这种接线不证明任意 CUDA标识/HCU 上的 kernel 都可用。
+
+非 SP 下 Triton/TileLang 的局部词表贡献经 copy_to_tensor_model_parallel_region 在 backward 归并 dHidden；Liger 继续按自己的 TP-FLSCE 合同处理，不能重复求和。SP gather 的 backward 所有权也依 backend 区分。当前测试新增 policy/top-k 的 sequence×batch 转置、重复 top-k label 和 processor 接线断言，是局部合同证据，没有执行设备数值回归。
+
+FSDP 的 fused teacher/rollout head 必须为 jagged nested tensor，Ulysses suffix padding 与 token stream 同步，回传 top-k 再 gather/unpad。Megatron eager score-centering 在 in-place CE 前另 clone logits，避免其 backward 重读被改写；top-k processor、router replay 和 THD preprocess 同收 bucket/quant_align/CP layout。动态 CP 仍明确拒绝 score-centering，不能因普通静态路径放开就绕过。FSDP batch_invariant 拒绝 fused kernels，full_determinism 最后应用；其 eager sampler-compatible logp 使用未缩放 logits 和对应 temperature，不能再额外缩放一次。
+
+seqlen_balancing、core_algos 与所引聚合/预算测试字节未变，保留原硬 token 上限和目标分母。新增 padding、logits clone、workspace 与 TP collective 各有内存/时间代价，必须按实际 backend、最坏 rank 和同目标数值验证，不能由新后端名称宣称加速。
 
 ## 验证、失败和更新
 
@@ -158,3 +203,16 @@ Megatron的top-k distillation processor现显式收到同样的quant_align_size�
 - [tests/models/test_model_forward_fused.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/tests/models/test_model_forward_fused.py)
 - [tests/workers/test_megatron_liger_fused_kernels_on_cpu.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/tests/workers/test_megatron_liger_fused_kernels_on_cpu.py)
 - [verl/workers/config/rollout.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/workers/config/rollout.py)
+
+
+## 2026-11-18 固定消费者
+
+- [verl/trainer/ppo/v1/trainer_base.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/ppo/v1/trainer_base.py)
+- [verl/trainer/ppo/v1/utils.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/ppo/v1/utils.py)
+- [verl/models/mcore/model_forward_fused.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/models/mcore/model_forward_fused.py)
+- [verl/models/mcore/util.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/models/mcore/util.py)
+- [verl/utils/kernel/linear_cross_entropy.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/utils/kernel/linear_cross_entropy.py)
+- [verl/workers/engine/fsdp/transformer_impl.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/engine/fsdp/transformer_impl.py)
+- [verl/workers/engine/megatron/transformer_impl.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/engine/megatron/transformer_impl.py)
+- [verl/workers/engine_workers.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/engine_workers.py)
+- [tests/models/test_model_forward_fused.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/tests/models/test_model_forward_fused.py)

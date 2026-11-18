@@ -1,15 +1,14 @@
-# 当前任务：lite 后续维护全面复核（2026-11-05）
+# 2026-11-18 独立第二阶段交付
 
-用户要求重新全面 review，并确认后续按 lite 方式更新 lite、本地 checkout 也在 lite。此轮只修正重构与长期维护契约，不全量刷新资料、不变更训练环境。
+第一阶段 HCU-Knowledge 已先行完成并冻结：lite a3a5be59183d564e54897e8a653604be8c91d505 / v0.6.3，两个远端分支/标签一致，四项实际 CI 通过；本阶段对其只读。
 
-- 阶段一 HCU-Knowledge 已独立完成：lite fb5d29e10b5a864d1349b10e472dab0fe5b16c31 / 0.6.2；GitHub/GitLab 两端一致，本地 321 项测试、四项远端 CI 通过。此后该仓、索引、安装和远端只读。
-- 阶段二 TrainFlow 从干净 lite a41cc005080b0803e78b11c6acdc5a5349e9ad70 / 0.8.0 开始；既有重构已发布且七项 CI 通过。当前修正应用后无变化更新、删除路径证明、查询缓存、条件 catalog、弱命中联搜及目标分支 guard；保留原件、历史和检索入口。
-- 长期规则：共享知识维护使用配置中的 lite，原始来源自己的 ref 独立选择；普通 PR 只发现 URL，正文、代码、必要讨论按需读取，不逐仓报告、不要求评论镜像。明确请求的后续更新应实际刷新选定来源，旧未刷新状态仅描述带日期的重构快照。
-- 本地复核完成：Skill/docs 契约 78 项通过，完整软件测试 1427 passed / 4 平台条件 skipped，最后增量/原件/分支/联搜/登记漂移边界 151 项通过；1458 页、24 来源的知识组织、覆盖、文档、阅读资源检查通过。既有包 0.8.1、六项 Skill 已同步，全部 11 项必需 Skill 及三个受管依赖只读检查 current/ready。
-- 发布验收规则：本轮单独提交 origin lite，核对实际 CI 和远端 refs；不动 main/旧标签，不自动打新 tag。提交 SHA、最终 CI 结果、清洁状态与两仓本地分支的权威回执记在 .work/lite-review-20261105/publication.json，不能用本计划代替实际发布证据。
+本阶段基于 HCU-TrainFlow lite aca3d82df82a6e343240d936666a9d1fb5abc3c7，按用户授权形成 0.8.2 交付：
 
-写入范围：本 TrainFlow checkout 与本轮 .work/lite-review-20261105；按既有授权同步六项已安装 Skill 和系统 Python 已有包元数据。不装新依赖，不操作训练/GPU，不触碰其他任务 Store。已有原始重构验收和退役凭证在 .work/lite-refactor-20261105 保留。
+1. 全部 24 登记来源在固定版本完成采集及内容复核，98 个作者页保留 ID 与历史 pins；父子仓按实际 gitlink，Hyperloom 按用户确认改官方入口。
+2. 36 个触发的维护目标及其他真实消费者已复核，共 47 个流程文件决定；联动容错、底层库、数值/数据、缓存与权重发布边界，部署 TraceLens 等训练依赖保持原锁。
+3. native wiki-review/apply 全部完成，无 pending；必要正式收据、许可新旧原件和 16 个登记网站响应/正文随仓保留。普通 PR 不新增正文/评论镜像，临时采集与测试仍只在本轮 .work。
+4. 知识、覆盖、文档与资源检查通过；系统 Python 完整软件测试 1438 passed / 4 Linux 条件项 skipped。16 个跨库检索样例及全文、冷代码/历史原件、在线 PR 入口与实际 CLI 已检查。
+5. 六项本机 Skill 与既有 TrainFlow 0.8.2 元数据离线同步，并通过 --check；没有安装/升级上游训练库或操作 GPU/集群。
+6. 发布遵循用户既有授权：仅提交和 push origin/lite，核验此提交实际 CI 后独立推送新小标签 v0.8.2。main 与旧标签保持不动，不 force；Git 引用和 CI 结果作为最终发布证据。
 
-本仓 AGENTS 要求有用独立工作划分 scope：lite_acquisition 负责来源增量运行时和隔离回归；lite_skills_install_ci 负责六项 Skill/docs/依赖锁；lite_coverage_docs 提供独立边界审查；主控负责检索联搜、CLI guard、验证器/CI、集成与发布。
-
-此前旧备份、测试目录及冷验证副本残余清理被自动审批 blocked by policy 拒绝，保持原状，不重试或换工具绕过。本轮不进行清理。
+内容与字节证据见 knowledge/catalog/review-20261118.json、validation-20261118.json 及所链收据。本轮有用并行审核已汇总并由主控验收；软件验证不代替 HCU 训练资格。此前策略拒绝的旧备份、pytest-final 与冷验证目录保持原状，不绕过拒绝。

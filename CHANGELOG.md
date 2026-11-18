@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.2 — 2026-11-18
+
+- Review the 24 registered official sources at fixed revisions and revise affected guides, topics and workflows. Preserve historical evidence, parent-selected child commits, proven removals and explicit deployment/runtime gaps; use the official Hyperloom repository after the personal fork was deleted.
+- Align actual HCU library and recovery consumers with the independently published HCU-Knowledge v0.6.3 snapshot. Clarify async resource ownership, completion, numerical/data contracts, SSH/NRE/Ray control paths and inference weight publication without upgrading training dependencies.
+- Keep discovery-first PR URL search and on-demand original/code reading. Publish bounded content/workflow review evidence, retain changed license notices with their history, and preserve their exact bytes across checkouts.
+- Synchronize the six installed Skills and local TrainFlow package metadata. Source review and CPU software checks add no new hardware qualification.
+
 ## 0.8.1 — 2026-11-05
 
 - Make lite the persistent maintenance branch and keep new installations on it. Check the selected TrainFlow target and configured branch before shared CLI writes; preserve unrelated changes and read-only search. Upstream source refs remain independent.

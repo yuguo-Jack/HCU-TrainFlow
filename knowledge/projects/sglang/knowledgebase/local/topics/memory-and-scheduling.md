@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: reviewed implementation chains and official guides; not all models, backends or HCU runtime qualification
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: sgl-project-sglang
   path: docs/docs/advanced_features/sglang_for_rl.mdx
@@ -109,6 +110,43 @@ sources:
   path: test/registered/unit/mem_cache/test_kv_layer_router_parts.py
   commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
   sha256: 78f882d079b06c35582252dd44f86d6aa3b5d696b1097a77b5b8b049ba2a74ac
+- source: sgl-project-sglang
+  path: docs/docs/advanced_features/sglang_for_rl.mdx
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 913fc4f4726b9ff0160fe66e2d3bd06fca561c780ddc378c0b29d80fac16c05a
+- source: sgl-project-sglang
+  path: python/sglang/srt/entrypoints/http_server.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 4f12b6f21438c4493a122fc940c14ba275f11e9778bf211731c6a623327e88b9
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 523c96a107548ce1b3871b5fe8191faa797085225030acbb9e3839ff4cac4fcd
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth_levels.json
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: ecb5585cdf47c833231e44daf0355ef20ea7ab2583d171f95569359a99623ce1
+- source: sgl-project-sglang
+  path: python/sglang/srt/managers/scheduler.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 3c2d691b22613a2c036d01105ada28bc39801251c51db5cb44f7cce5170bb653
+- source: sgl-project-sglang
+  path: python/sglang/srt/managers/scheduler_components/weight_updater.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 964e30afb6782e2acdd04579b063f1da73e82081240b97645d84cf42b3cadbea
+- source: sgl-project-sglang
+  path: python/sglang/srt/managers/tokenizer_control_mixin.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 8a0f84925b61487add6ba8332e290992dea017c3c084aeeb2d00d1f8cb8c861e
+- source: sgl-project-sglang
+  path: python/sglang/srt/mem_cache/kv/router.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: cb87d056b2e4e43fcf6446de8354b42ace799eaa97f7cf18b824c708f1c01826
+- source: sgl-project-sglang
+  path: python/sglang/srt/mem_cache/kv/alloc/id_space.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: de80cddfa18bb2c5232fc187edc3a3e76c8e7034b2e06b0562b0bfa38ad11935
+retrieved_on: '2026-11-18'
 ---
 
 # SGLang 显存与 rollout 调度：睡眠、KV、prefix 与数值边界
@@ -169,7 +207,7 @@ Scheduler 的 admission 同时受 pipeline request budget、空闲 req-to-token 
 
 本轮 admission 还需预留 host loadback 的 gather scratch 后才能排队 H2D；prefix 改变后要重新核对 reserve，避免发起无可消费 workspace 的 loadback。DCP 的逻辑 page padding、recurrent state 的 chunk 对齐与计算 token 预算分别计数；最终 chunk 和中间 chunk 的对齐要求也不同。`calc_priority` 返回新的排序列表，调用者须使用返回值，不能假定 waiting queue 被原地排序。
 
-普通 MHA 的 K/V 合并分配快路显式排除 HIP 和 torch.compile；typed-view 迁移并不等于 HIP 也使用该 fused storage。对应 layer-router 单测检查复合池的指针/模型层映射、MLA 写入不改全局 layer ID、window 能力；part-router 测试检查分层等待和无 state 层的 stage。这些是已阅读的上游测试合同，未在本机执行。
+普通 MHA 的 K/V 合并分配快路显式排除 HIP 和 torch.compile；typed-view 迁移并不等于 HIP 也使用该 fused storage。2026-11-04 固定 fd19 历史版本对应的 layer-router 单测检查复合池的指针/模型层映射、MLA 写入不改全局 layer ID、window 能力；part-router 测试检查分层等待和无 state 层的 stage。这些是该历史版本已阅读的上游测试合同，未在本机执行；当前固定版本已移除旧 layer-router 测试文件，不能沿用为当前覆盖证明。
 
 ## 数值与恢复验证
 
@@ -210,3 +248,11 @@ Scheduler 的 admission 同时受 pipeline request budget、空闲 req-to-token 
 
 
 本页在 2026-11-04 复核上述固定源码、教程与两项 router 测试合同；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+
+## 跨 rank 释放确认与新 KV 子池身份
+
+`78b8523f77ea6b930d065c9dd128a97b222a35c9` 在操作tags前先用TP CPU组MAX归并busy；任一rank不idle就共同返回失败，成功路径在设备同步后再做TP barrier，Tokenizer合并回复并传播业务失败。空闲检查使用typed request lists：不持KV的PD_HELD可跨更新保留，paused等待队列中仍持KV的请求会阻止flush；UOCR、PD receiver/offload、HiCache buffer pipeline、LMCache和external-linker预取也按实际启用路线检查。健康探针的idle集合仍不同。
+
+这些检查没有把多tag操作变成事务；中途daemon/weights门禁失败仍可能已变更其它tag，应保存实际完成点。新控制端点要求admin凭据，HTTP状态与业务完成、TP全部释放和真实资源下降分别验收，不盲目重发默认all-tags。涉及权重重写的路径还先等待已launch forward，不能以Python侧pause标志推断旧读已结束。
+
+KV router现在把attention role与实际sub-pool名称映射分开，并携带各window的范围。window层写入必须从按sub-pool命名的 `window_locs` 取自己的IDs，不能继续假设一个统一`swa_loc`。`storage_name`、物理write-loc及draft路由各按当前view映射；自定义backend/HiCache适配需验证混合window、model-layer到view-layer、虚实slot与restore身份，不能因shape或layer编号相同绕过typed路由。

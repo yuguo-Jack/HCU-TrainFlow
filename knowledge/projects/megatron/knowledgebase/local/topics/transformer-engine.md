@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/extensions/transformer_engine.py
@@ -41,10 +42,46 @@ sources:
   path: megatron/core/optimizer/__init__.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: e3f559f8606e1373c1ce5343f74f65492ee16224543dde7d617131b74cf76b83
+- source: nvidia-megatron-lm
+  path: megatron/core/extensions/transformer_engine.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 830eb05f91238eafc12e1bfb32942d95e3843c3330ac6681ef2411df2fb1e62e
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/multi_latent_attention.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 4d08649f45e99d958a416bf28a530976cc83551d61c76fccdb5b656515b8e480
+- source: nvidia-megatron-lm
+  path: megatron/core/extensions/te_cuda_graphs.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 3f1b8d0a46a071bea2bec94a2017d25db0d8ad12da6d5fa92afa79c85029a036
+- source: nvidia-megatron-lm
+  path: megatron/core/models/gpt/gpt_layer_specs.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 243c3f4d670c3521386660ba7dd8148e56803574e8e8c1017282aedcadaf66f8
+- source: nvidia-megatron-lm
+  path: tests/unit_tests/transformer/test_multi_latent_attention.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 7e3677997822acdf9f39285de4bc785ada2337a533fffab9dc0af8b2dc823079
 retrieved_on: '2026-11-04'
 ---
 
 # Megatron Core→Transformer Engine：配置、融合、低精度与HCU接口
+
+## 2026-11-18：实际 recipe、运行期 CP 与新同步 owner
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+模块级 quantization override 先针对外层 autocast 判定是否继承，op-fuser 中相邻 linear 应比较同一个外层上下文，不能先进入其中一层再判断另一层。recipe_attrs 会作用于构造出的 TE recipe；FP4 模型的 LM head 可另进 MXFP8 autocast，不能用“模型是 FP4”推定头部同精度。MLA 还依据导入时读取的 DPA recipe/format、实际 FP8 DPA/backward、custom recipe 等门禁决定预量化融合；改变环境后须按真实进程初始化重新核验，配置名不能替代 dispatch。
+
+TE attention 现在检查明确 TP/CP group 是否非空，hierarchical a2a+p2p 使用所属 collection.hcp；runtime cp_group/local_cp_size/tp_cp_group 属于 MCore 布局/绑定元数据，不作为 TE forward kwargs 透传。GDN 的不同 runtime head geometry 使用无参数/无 buffer 的实例缓存，不能让选择不同 CP 后改变 checkpoint state。TE 图调度及 offload stream/event 由 `extensions/te_cuda_graphs.py` 专用入口维护；[MLA residual 案例](../cases/mla-residual-norm.md)的 has_residual/数值对照仍成立，但不能覆盖这些新的精度/分组路径。
+
+### 本节固定证据
+
+- [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/extensions/transformer_engine.py)
+- [megatron/core/transformer/multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/multi_latent_attention.py)
+- [megatron/core/extensions/te_cuda_graphs.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/extensions/te_cuda_graphs.py)
+- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/models/gpt/gpt_layer_specs.py)
+- [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/tests/unit_tests/transformer/test_multi_latent_attention.py)
 
 ## 本页的职责
 

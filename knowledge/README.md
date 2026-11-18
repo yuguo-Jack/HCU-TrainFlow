@@ -22,7 +22,7 @@ visibility: public
 
 ## 搜索与来源层
 
-- [PR 描述、review、diff 与固定源码索引](PR-INDEX.md)
+- [PR 联搜与固定历史阅读入口](PR-INDEX.md)
 - [按项目进入：整理后的知识、官方文档、PR 与源码地图](projects/README.md)
 - [全库来源游标与文档清单](catalog/) / [外部 HCU 知识与用法关联](catalog/external-knowledge.json)
 - [搜索与持续更新](../docs/wiki.md) / [私有训练经验与 Cookbook 记录](../docs/experience-knowledge.md)
@@ -72,10 +72,12 @@ HCU 仓库的目录、构建、源码、PR 和案例由 HCU-Knowledge 维护。�
 
 ## 目录规则
 
-每个官方项目位于 `projects/<project>/`，`README.md` 统一导航。项目内 `knowledgebase/upstream/{docs,prs,source-map}` 保存来源，`knowledgebase/local/{overview,guides,topics,cases,changes}` 保存解释。跨项目原始 PR JSON 集中放 `evidence/prs/`，每篇 PR 页链接其固定原件。`catalog/` 维护游标与关联。Release/roadmap 通过官方链接和相关版本解释查证，不另建发布页全量快照库。
+每个官方项目位于 `projects/<project>/`，`README.md` 统一导航。项目内 `knowledgebase/upstream/{docs,prs,source-map}` 保存正式选定的来源，`knowledgebase/local/{overview,guides,topics,cases,changes}` 保存解释。精选 PR 页链接 `evidence/prs/` 中的固定原件；普通 PR 通过在线入口按需阅读，已退役的历史原件继续由固定 Git 基线读取。`catalog/` 维护游标、关联及必要复核收据。Release/roadmap 通过官方链接和相关版本解释查证。
 
 ## 更新方法
 
-`wiki-update` 检查全仓目录、文档与 PR 增量、登记源码，生成受影响页面和工作流清单；用 Wiki update Skill 深读差异、PR 顶层 review/评论/代码后修订所有关联结论，最后 `wiki-review` 写复核回执、`wiki-apply` 写来源锁、`wiki-index` 重建搜索。运行中的任务继续使用原锁定快照，升级需重新建立 context。
+后续日常维护在 `lite` 分支按发现优先方式进行。`wiki-update` 检查选定固定版本、登记路径和有界 PR 入口，生成真实受影响页面与工作流清单；重要变化沿实际函数、调用方和必要讨论复核，已有有效解释继续复用。需要新文档或完整目录时再显式检查，普通 PR 不镜像评论/review，也不逐仓新写报告。最后由 `wiki-review` 绑定当前内容哈希，`wiki-apply` 写来源锁，`wiki-index` 更新搜索；运行中的任务继续使用原锁定快照。
 
 收录前先按[内容筛选规则](../docs/knowledge-architecture.md)检查相关性和复用价值。来源配置的 `document_scope` 说明范围，`document_exclusions` 保存排除路径及理由；增量同步不会恢复已排除页，保留页与排除规则冲突时先明确整理。完整源码导航和线上 PR 检索仍保留。更新时同时复核同仓总览、专题、案例与受影响用法，验证后按[本机同步步骤](../docs/integrations.md#skills账号与升级)更新安装；普通查询不做正式收录。
+
+2026-11-18 的独立联动输入为 HCU-Knowledge `v0.6.3` / `a3a5be5`；本次[内容与流程复核收据](catalog/review-20261118.json)、[原件/在线阅读检查](catalog/reader-check-20261118.json)和[许可复核](catalog/license-review-20261118.json)随仓保留。固定源码阅读、软件检查和 HCU 现场资格分别记录。

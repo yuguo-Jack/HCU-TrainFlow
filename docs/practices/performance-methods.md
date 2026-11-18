@@ -20,6 +20,12 @@
 
 2026-11-04 再核对登记来源：Hyperloom 仍为上述 `0425bde`；BBuf 当前观察 [`371dee04ee30ed918b240823b2a12c139d1a67fa`](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/371dee04ee30ed918b240823b2a12c139d1a67fa)。其监测文档仅 README 变化，profiler、incident 和 model-optimization 入口哈希未变；README 新增发行/视频说明，仍要求精确工作负载、原件、实际路径精度和“来源刷新不是 GPU 重测”。这些变化不改变上表三表、oracle、重叠归因与停止方法；GEAK 继续只声明已列固定源码的有界查证，不称已全仓更新。
 
+后续固定 BBuf [`97d0c79da43c4cac6ed417d7f0d5269aeac38010`](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/97d0c79da43c4cac6ed417d7f0d5269aeac38010) 的 profiler/incident 方法已发生实质变化：采集与鉴权按实际服务路由和版本核对，量化 oracle 对照独立公式，融合缓存随 residual/row selection 等状态变化验证失效条件。采用这三项方法，保留各框架采集控制、schedule 与部署差异；不将其 SGLang/TokenSpeed 的具体环境变量或推理门槛变成 HCU 训练默认。具体变化见 [BBuf 方法说明](../../knowledge/projects/bbuf-skills/knowledgebase/local/overview/engineering-guide.md)。
+
+2026-11-18，用户确认原 Hyperloom fork 已删除并要求直接核对官方来源；登记的稳定 source id 保留旧身份别名，当前仓改为 AMD-AGI/Hyperloom，固定 [`d79d7a70384e3ea6be737d296bdfd476965da471`](https://github.com/AMD-AGI/Hyperloom/tree/d79d7a70384e3ea6be737d296bdfd476965da471)。上表 `880c167` 与旧 fork `0425bde` 继续作为历史方法证据，不能代替当前官方源码。现在的[分析刷新策略](https://github.com/AMD-AGI/Hyperloom/blob/d79d7a70384e3ea6be737d296bdfd476965da471/src/kernelforge/workflows/forge_loop/policy/analysis_refresh_policy.py)与[搜索策略](https://github.com/AMD-AGI/Hyperloom/blob/d79d7a70384e3ea6be737d296bdfd476965da471/src/kernelforge/workflows/forge_loop/search/search_policy.py)已移入 `workflows/forge_loop`；[闭环](https://github.com/AMD-AGI/Hyperloom/blob/d79d7a70384e3ea6be737d296bdfd476965da471/docs/conceptual/optimization-loop.md)与[工作占比警告](https://github.com/AMD-AGI/Hyperloom/blob/d79d7a70384e3ea6be737d296bdfd476965da471/src/hyperloom/orchestrator/trace_analysis/_idle_gate.py)也已在该固定提交查证。
+
+当前官方方法仍把分析与源码 commit、迭代和刷新尝试绑定：失败或部分完成保留 stale/partial 状态，达到尝试预算不代表证据变新；重复无代码变化优先触发搜索模式切换。采用这些状态与停止原因，不继承其固定5%收益阈值、窗口长度或 Agent 配额。idle gate 的默认80% idle/10% compute 只是推理参考工程的候选筛选：高 GPU busy 也可能是 collective spin-wait，Graph 少采集时跳过警告不代表覆盖合格。TrainFlow 继续检查完整训练窗口、真实 rank 到达与等待、至少90%覆盖及高占比未知项；assembly-only 的额外编译/正确性分层也不替代模型集成与阶段 loss。具体入口与适用边界见 [Hyperloom 方法说明](../../knowledge/projects/hyperloom/knowledgebase/local/overview/engineering-guide.md)。
+
 TraceLens 原生 Agent 的方法另按当前固定 HCU fork `22786b16d429783927981bd592a47ad0f79db3ba` 的[分析步骤](https://github.com/yuguo-Jack/TraceLens/blob/22786b16d429783927981bd592a47ad0f79db3ba/TraceLens/Agent/Analysis/skills/analysis-orchestrator/reference.md)及 `hcu_analysis.py` 复核。其 top-10 选项和 idle >15% 的 CPU 分析触发条件是该工具的筛选策略，不是 TrainFlow 的 ≥90% 端到端覆盖标准；未生成某类 finding 也不证明不存在该瓶颈。类别执行、metrics、findings 和最终报告各有状态/输入绑定；`metrics_complete` 或字段/表一致性检查不证明推理正确，实际因果、训练正确性与收益仍按本仓闭环复验。`fusion_flagged` 去重不能作为已近上限或停止算子迭代的理由。
 
 ## 真实训练案例的采用边界
@@ -48,12 +54,12 @@ TraceLens 原生 Agent 的方法另按当前固定 HCU fork `22786b16d4297839279
 | `runtime-failure-triage`、`rccl-sm-free-p2p` | 数据/通信契约和异步错误；减少占用 CU 的路径是否有利，要看实际调用和模型重叠而非变量存在 |
 | `pytorch-memory-stream-graph-lifecycle`、`torchcomms-async-functional-watchdog` | 调用返回、设备完成、消费 stream 依赖和 host 检测不同；buffer/graph/异步通信生命周期 |
 | `aiter-int8-fp8-collective-contract`、`rocshmem-hcu-engineering`、`deepep-current-hcu` | 位传输、数值规约与量化的 oracle 分开；真实消费者的固定依赖、provider 和原地输出协议决定安全回退，独立库 HEAD 的新能力不能直接外推 |
-| `primus-turbo-current-maintenance-line`、`primus-prepared-graph-ck-contract`、`te-fp8-state-and-recompute`、`te-linear-norm-communication-lifecycle` | 每次 backward 的独立 dW 或直写 main_grad sink 必须恰好累计一次；prepared Graph 的 source owner、重放标记、编译准备阶段副作用、低精度持久状态和 UB 缓存须随候选复核，compile 与 Graph 资格分开 |
+| `primus-turbo-current-maintenance-line`、`primus-prepared-graph-ck-contract`、`te-fp8-state-and-recompute`、`te-linear-norm-communication-lifecycle` | 每次 backward 的独立 dW 或直写 main_grad sink 必须恰好累计一次；eager 延迟 source read 的 completion/lease 与 prepared Graph 分别验证，调用返回不证明可复用资源；Graph 重放、编译准备、低精度状态和 UB 缓存随候选复核 |
 | `miopen-tuning-and-cached-solution`、`rocshmem-registered-memory-stream-contract`、`moonep-release-contract` | handle 策略与环境/缓存、注册内存与 stream 生命周期、状态折叠与错误传播按消费者及制品查证；减少 host 读取不证明设备完成或错误已检查 |
 | `dcc-engineering-handbook`、`galaxy-engineering-handbook`、`triton-hcu-mls-pipeline-contract`、`tilelang-hcu-pass-ownership` | 前端/后端/runtime 与生成代码分别固定；同步所有权、memory scope、capture 限制与 launch ABI 变化会使旧证据失效，静态资源数字不替代计数器或硬件回归 |
 | `rocblas-kme-padding-contract` | 孔明e GEMM padding 案例；分析 GEMM 连同额外 copy/workspace，不能只量主矩阵指令 |
 
-以上联查入口于 2026-11-04 对照 HCU-Knowledge `c08470f7c1032f8ad9f072a161c687d2a6b50a3b` 复核；ID 以当前 KB 索引为准，缺项时按标题/机制搜索。新库布局、provider、直写梯度和状态折叠会使旧 dispatch/oracle/重叠证据失效，按现有刷新规则重评；历史实验仍保持原条件。具体接口检查落在优化 Skill 的[库接入](../../skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)和[通信专项](../../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，不在本页复制一套实现说明。知识中的源码分析和历史实验不自动成为当前硬件的性能基线。
+以上联查入口保留 2026-11-04 的固定范围；后续维护使用已发布的 HCU-Knowledge `a3a5be59183d564e54897e8a653604be8c91d505`。本次重要边界包括 PrimusTurbo 经资格选择的 eager Deferred completion/lease，以及 MoonEP 发行同步入口的 `zero_copy=True`/`event=None`；接口的等待、回退和资源归属变化，会使原调度/重叠/独立回放证据失效，不能因报告仍能生成而直接复用。ID 以当前 KB 索引为准，缺项按标题/机制查找。历史实验保持原条件，具体接口检查仍落在优化 Skill 的[库接入](../../skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)和[通信专项](../../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，不在本页复制实现说明，也不把源码分析自动当作当前硬件的性能基线。
 
 ## 在现有流程中的位置
 
@@ -87,7 +93,7 @@ flowchart TD
 
 ### TraceLens 调用链核对
 
-2026-10-13 专项核对的固定源码为 Hyperloom `0425bde`、GEAK `c0c0e2a`，与前文通用方法的参考版本分别保留。它们并未要求每次执行全部 TraceLens 工具。
+2026-10-13 专项核对的固定源码为旧 Hyperloom fork `0425bde`、GEAK `c0c0e2a`，与前文通用方法的参考版本分别保留。它们并未要求每次执行全部 TraceLens 工具。旧 fork 已删除；该快照中的调用链仍保留历史身份，当前官方 `d79d7a7` 的相关模块已移入 `src/hyperloom/orchestrator/trace_analysis/`，不把旧路径当作当前入口。
 
 | 参考实现 | 实际采用的方法 | TrainFlow 的落点 |
 |---|---|---|

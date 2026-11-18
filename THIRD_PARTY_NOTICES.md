@@ -23,7 +23,7 @@ lite 当前树只直接保留重要/引用 PR 的固定原件，普通 PR 通过
 
 | 工程 | 参考内容 |
 | --- | --- |
-| [Hyperloom 上游](https://github.com/AMD-AGI/Hyperloom) / [用户 fork](https://github.com/yuguo-Jack/Hyperloom) | 多 Agent 编排、证据刷新、热点到源码的交接、候选与最佳实现管理，以及 TraceLens 调用方式 |
+| [Hyperloom 官方来源](https://github.com/AMD-AGI/Hyperloom)（历史 fork 已退役） | 多 Agent 编排、证据刷新、热点到源码的交接、候选与最佳实现管理，以及 TraceLens 调用方式 |
 | [GEAK](https://github.com/AMD-AGI/GEAK) | 端到端与算子优化衔接、真实 dispatch、逐 shape 分析、包装开销、组合回归与停滞处理 |
 | [BBuf AI-Infra-Auto-Driven-SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS) | profiler 调用映射、热点/重叠/融合分析、先保存证据再复现和升级工具的故障定位方法 |
 | [hygonpilot-skills](http://42.228.13.241:10068/qianyj/hygonpilot-skills)（内部） | Torch 原生训练的框架、通信与 Inductor 分支，冷启动/稳态区分、按收益路由和最佳版本回退；独立整理方法，未导入其知识目录或打包私有源码 |

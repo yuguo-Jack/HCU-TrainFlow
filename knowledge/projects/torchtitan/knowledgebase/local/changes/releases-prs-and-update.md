@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: README.md
@@ -70,7 +70,38 @@ sources:
   path: torchtitan/rl/generator/generator.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: fe3ccd0288aa613d11234607fa24e91e98953015dd75a49657da0b4c7dd56b01
-
+- source: pytorch-torchtitan
+  path: README.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 4c4c416b469463defac6b9302dbe006ff5d0a1b5d47dc1f8323d0ef012abe8da
+- source: pytorch-torchtitan
+  path: .ci/docker/requirements.txt
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 2a90200bd0a8cbd376c5d83ab262feac30fa366ffc311b55d66aee90a9b9691e
+- source: pytorch-torchtitan
+  path: torchtitan/training_engine.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: ecbe72af3cdf4eba9d8093eb07c6178b2046063e87e574ed0d43f5861ab982ab
+- source: pytorch-torchtitan
+  path: torchtitan/models/base/module.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 3b275b99acbcfbf8ea2990560d612567fef4b565908a82c4bd177b021e7a7f24
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/activation_remat.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 362ef9fe3fe98768aaeeff731bf75735ad85b69fb0a8797dbe211fc2e403421e
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/fsdp.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: a66e3d1d82ed1c792bcfa2b3070f36bcb2f97cb809e1d1c8e5b213768232744d
+- source: pytorch-torchtitan
+  path: torchtitan/rl/controller/controller.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: e7111207a551e02c27b80dc4059b354353204dcbfb1d1af6ab54f423212c941b
+- source: pytorch-torchtitan
+  path: torchtitan_recipes/rl/model_configs.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: fe0da78525a977441c3d762b4cbfef36485de6b9c206dd593e11cd9c3e55ff00
 pr_sources:
 - pr-pytorch--torchtitan-4760
 - pr-pytorch--torchtitan-5033
@@ -90,7 +121,7 @@ pr_sources:
 
 | 内容 | 已收录范围 | 不能由此推断 |
 | --- | --- | --- |
-| 源码 | main 的固定提交 `485c065cb248863bf2e2c65588becd6d7a8bcf83`；全仓路径/对象清单 | 全部文件已逐行精读或硬件验证 |
+| 源码 | main 固定 `361ae5df6280e578614026b206d801d6ea1baf98` 与保留的历史 pins；全仓路径/对象清单 | 全部文件已逐行精读或硬件验证 |
 | 作者专题 | 15 页总览、目录、安装运行测试、训练/数值、并行/显存、编译通信、MoE/量化、profile、恢复、RL 与 3 个案例 | 每个模型/后端均已形成完整专题 |
 | 官方原文 | 当前来源锁、文档 ledger 与全仓路径清单中的训练教程/README | 图表、外链或依赖工程已全部离线复制 |
 | PR | 已保留的重要历史 PR 与本次增量窗口；完成范围以独立 PR ledger 为准 | 历史 PR 全量采集或全部案例精读 |
@@ -113,7 +144,7 @@ pr_sources:
 | --- | --- | --- |
 | Config / recipe / override | [安装运行](../guides/build-run-test.md) | `config/README.md`、`config/OVERRIDE.md`、`torchtitan_recipes/README.md` |
 | 目录、模型和数据 | [源码地图](../overview/source-map.md)、[模型与数据](../topics/models-and-data.md) | `models/*/README.md`、`components/data/README.md` |
-| 并行、PP、FSDP、重算 | [并行与显存](../topics/parallelism-and-memory.md) | `distributed/PARALLELISM_CONTEXT.md`、`PIPELINE_PARALLEL.md`、`FSDP.md`、`REMAT.md` |
+| 并行、PP、FSDP、重算 | [并行与显存](../topics/parallelism-and-memory.md) | `distributed/PARALLELISM_CONTEXT.md`、`PIPELINE_PARALLEL.md`、`FSDP.md`、`ACTIVATION_REMAT.md` |
 | Compile / Graph / MoE | [编译通信](../topics/compile-fusion-and-communication.md) | `experiments/graph_trainer/README.md`、`models/common/dist_moe/README.md` |
 | MXFP8 / NVFP4 / optimizer state | [低精度](../topics/moe-and-low-precision.md)、[数值](../topics/training-and-numerics.md) | `quantization/*/README.md`、`components/optim/BF16_OPTIMIZER_STATES.md` |
 | Profiler / debug / benchmarks | [性能诊断](../topics/profiling-and-diagnosis.md) | `observability/`、`docs/debugging.md`、`docs/benchmarks/` |
@@ -155,7 +186,7 @@ hcu-trainflow wiki-code pytorch/torchtitan 485c065cb248863bf2e2c65588becd6d7a8bc
 hcu-trainflow wiki-update . pytorch-torchtitan --max-documents 100 --max-prs 50
 ```
 
-普通检索只写私有缓存。Wiki update Skill 先看权限/新鲜度和完整文件树，再处理文档新增/变更、PR 讨论与源码差异；按问题可补任意历史或尚未收录的 PR。新增模型文件即使不匹配当前 document globs 也能通过全树发现，随后决定是否扩大收录范围。
+普通检索只写私有缓存。Wiki update Skill 先看权限/新鲜度和完整文件树，再处理重要文档/源码变化，普通 PR 在线发现并按问题阅读；按问题可补任意历史或尚未收录的 PR。新增模型文件即使不匹配当前 document globs 也能通过全树发现，随后决定是否扩大收录范围。
 
 主线/PR 变化后同时复核同仓总览、专题、案例，以及 `maintenance.json` 关联的 Torch 原生训练指引、profiling 和精度方法。复核当前正文 hash 后写来源锁，更新 catalog 和索引，再验证本机安装。已在运行的任务保留自己的固定版本，不因 Wiki 更新自动替换依赖。
 
@@ -163,17 +194,17 @@ Release/roadmap 非 PR 内容由维护 Agent 沿官方入口核查并更新版�
 
 ## 本轮实际迁移与未决边界
 
-本轮对固定主线逐页沿消费者核对：根 PrecisionConfig 与 preserve-dtype 参数贯穿 FSDP/export/RL transfer；LocalCompileConfig 取代列表；accelerator-graph 重命名保持 HIP 拒绝；PP prepare 的四项输入与 loss kwargs 缺口已在实现和 CPU 测试修复。FSDP partial backward/group cleanup、DistMuon child communicator、模型级 loss kwargs/CP、checkpoint exports/完成标记和 Cuspy 输出格式均有实际变化。
+2026-11-04 对固定主线逐页沿消费者核对：根 PrecisionConfig 与 preserve-dtype 参数贯穿 FSDP/export/RL transfer；LocalCompileConfig 取代列表；accelerator-graph 重命名保持 HIP 拒绝；PP prepare 的四项输入与 loss kwargs 缺口已在实现和 CPU 测试修复。FSDP partial backward/group cleanup、DistMuon child communicator、模型级 loss kwargs/CP、checkpoint exports/完成标记和 Cuspy 输出格式均有实际变化。
 
-RL trainer 移除自有 CPU mirror，generator 增加 cpu_prefetch/gpu_fetch 并改为显式逐组 fetch、严格参数覆盖及失败全 rank 停机。旧 #5107/#5268 说明只作为机制历史与特定实验，当前接口详见专题和案例。WGRAD 核心/直接回归、Attention Residual override 未变，已在相应案例记录具体保留依据。
+2026-11-04 的 TorchStore 路线移除 trainer 自有 CPU mirror，generator 增加 cpu_prefetch/gpu_fetch 并改为显式逐组 fetch、严格参数覆盖及失败全 rank 停机。旧 #5107/#5268 说明只作为机制历史与特定实验，当前接口详见专题和案例。WGRAD 核心/直接回归、Attention Residual override 未变，已在相应案例记录具体保留依据。
 
 本轮 API/原件核对更正了旧 #4760 open 结论，当前为 merged；#5263 保持 open，head `d5e59c25e0900889fe19c2c3c7120273719c4373`、base `448b9c8be41abc7fcbd5ccc768242b8865d4347b`。后者仅为 opt-in shared-expert scheduling，默认关闭、仍等待 CPU counts，不支持由此宣称 compact training Graph 可用；作者验证为特定 H200 单机 BF16 EP8/TP/AC 矩阵，非 FP8/Dist-MoE/PP/CP/多机或收敛证明。上游 CI action_required 不等于通过。
 
-本页读了这两项的当前状态/说明及固定 main 消费者，全部 PR 评论、review 和文件覆盖由主控独立 PR ledger 表达，不冒称已完成全窗口语义审阅。没有安装、构建或执行上游训练/设备测试。
+本页读了这两项的当前状态/说明及固定 main 消费者，已保留历史 PR 的覆盖由其 ledger 表达，普通新 PR 不扩张为全部评论/review 镜像，不冒称已完成全窗口语义审阅。没有安装、构建或执行上游训练/设备测试。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/README.md)
 - [RELEASE.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/RELEASE.md)
@@ -209,3 +240,16 @@ RL trainer 移除自有 CPU mirror，generator 增加 cpu_prefetch/gpu_fetch 并
 - [torchtitan/rl/trainer/trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/trainer/trainer.py)
 
 - [torchtitan/rl/generator/generator.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/generator.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+当前 main 的重要消费者变化是逐 microbatch 逻辑 FLOPs、视觉处理器与 text/mm 模型分离、SPMD 边界不再自动 redistribution、按 block 的 remat，以及异步 collective 输入进入编译前保留 autograd edge。FSDP 增加 current-stream unshard 的受限选项，HF 导出/异步 staging 增加正确性门禁；不是单纯版本或路径刷新。
+
+RL 的 router 默认继续训练，仅关闭 load balancing；默认传输改为 NIXL/Mooncake 的预规划 pinned staging，TorchStore 为显式 None 的替代，`gpu_fetch` 仍要求它。生成模型 loader 抽到公共层，新增 drain 参数、Prompt 对象和与训练并行的 validation，旧无条件“无 CPU mirror”“冻结 router”和两端固定 pre/post validation 说明只属于原版本。
+
+`assets/version.txt`、`RELEASE.md` 和 pyproject 本轮内容未变；保留其固定证据与带日期的 release 观测，不把 main 新功能自动归入旧 release。原精选 PR 作为历史机制证据保留；普通新 PR 按 lite 方式发现与按问题阅读，不重建逐评论/review 镜像或要求每仓新增总结。
+
+固定入口：[README.md](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/README.md)；[.ci/docker/requirements.txt](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/.ci/docker/requirements.txt)；[torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/training_engine.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: pretrain_gpt.py
@@ -65,10 +66,51 @@ sources:
   path: megatron/core/optimizer/optimizer_config.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: f83b46a8a901bb7c792076544e2fefda3b76830ef2d971ecb976f0ac557fbc67
+- source: nvidia-megatron-lm
+  path: pretrain_gpt.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 1ba21dabb7284799ec1e7b2e37475e4037f8940452d6d40615d5eeba049c9a40
+- source: nvidia-megatron-lm
+  path: megatron/training/datasets/providers.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 4a7592946b98eb1d8a8eca33bbc46356ac2f27f4967d08c1b8abc58b32c2591d
+- source: nvidia-megatron-lm
+  path: megatron/core/parallel_state.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 72b099752dd73135d3608947593a56539249cb20e43e5359fa4b5a5621db7e62
+- source: nvidia-megatron-lm
+  path: megatron/core/extensions/te_cuda_graphs.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 3f1b8d0a46a071bea2bec94a2017d25db0d8ad12da6d5fa92afa79c85029a036
+- source: nvidia-megatron-lm
+  path: megatron/core/pipeline_parallel/fine_grained_activation_offload.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: c485208fe6b6989b6cd89e0d0f2614a061f7b5816ad5f7dd8b31d73319b856b6
+- source: nvidia-megatron-lm
+  path: megatron/core/extensions/transformer_engine.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 830eb05f91238eafc12e1bfb32942d95e3843c3330ac6681ef2411df2fb1e62e
 retrieved_on: '2026-11-04'
 ---
 
 # Megatron 代码目录：从配置、训练步到计算和恢复
+
+## 2026-11-18：当前入口迁移
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+`pretrain_gpt.py` 不再用 args 对象缓存重建 TransformerConfig，改读 `get_run_config().model.transformer`；dataset provider 的 rank 放置也消费该模型配置及明确的 PP group。`parallel_state.py` 已明确弃用单一全局 grid 的 group/rank/world-size accessor，新功能应传入所属 `ProcessGroupCollection`/group；`use_mpu_process_groups()` 仍是读取同一全局状态的兼容桥，不能把改成这层 wrapper 叫作完成迁移。initialize/destroy/is_initialized 本身不在这次弃用范围。
+
+TE 图调度与 offload 的专用同步入口在 `core/extensions/te_cuda_graphs.py`；旧 `FineGrainedActivationOffloadingInterface.forward_record/backward_record/enter_replay/exit_replay` 等方法不再是当前入口。通用 norm 工厂的导入路径也移动到 `core/ops/norm/torch_norm.py`。继续到实际调用者核对同步和生命周期，不只改 import 字符串；[显存](../topics/memory.md)、[重叠](../topics/overlap.md)与 [Core→TE](../topics/transformer-engine.md)保留具体门槛。
+
+### 本节固定证据
+
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/pretrain_gpt.py)
+- [megatron/training/datasets/providers.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/datasets/providers.py)
+- [megatron/core/parallel_state.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/parallel_state.py)
+- [megatron/core/extensions/te_cuda_graphs.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/extensions/te_cuda_graphs.py)
+- [megatron/core/pipeline_parallel/fine_grained_activation_offload.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/pipeline_parallel/fine_grained_activation_offload.py)
+- [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/extensions/transformer_engine.py)
 
 ## 目录与问题映射
 

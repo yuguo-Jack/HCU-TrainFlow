@@ -9,8 +9,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: baidu-baige-loongforge
   path: .gitmodules
@@ -44,7 +45,11 @@ sources:
   path: megatron/training/utils.py
   commit: 9d2d6b30f4099ed0e29300f76e19f55b72387ffc
   sha256: d4323db501330f50f12951c09dd324060879b676aa299bbd36ef6aad66d9be02
-retrieved_on: '2026-11-04'
+- source: baidu-loong-megatron
+  path: megatron/core/transformer/multi_latent_attention.py
+  commit: 343efbf4029e81697d32f54c6f924ac82b06677f
+  sha256: 10eabc83c8cf2f9d15085ddb87144eebb5ac8b6af06d569d5f3717f426b24a83
+retrieved_on: '2026-11-18'
 ---
 
 # LoongForge：变量长 ChunkPipe 的位置、缓存与梯度归一化
@@ -99,3 +104,9 @@ ChunkPipe 将一条序列拆成多个 chunk 推进模型计算；它与独立样
 - [megatron/training/arguments.py](https://github.com/baidu-baige/Loong-Megatron/blob/9d2d6b30f4099ed0e29300f76e19f55b72387ffc/megatron/training/arguments.py)
 - [megatron/training/training.py](https://github.com/baidu-baige/Loong-Megatron/blob/9d2d6b30f4099ed0e29300f76e19f55b72387ffc/megatron/training/training.py)
 - [megatron/training/utils.py](https://github.com/baidu-baige/Loong-Megatron/blob/9d2d6b30f4099ed0e29300f76e19f55b72387ffc/megatron/training/utils.py)
+
+## Causal bottom-right 的 dense mask 分配
+
+当前父仓选定的子锁 `343efbf4029e81697d32f54c6f924ac82b06677f` 在 `_adjust_key_value_for_chunk` 进一步按实际 attention 路径选择：非 SFT、非 DSA 的 pretrain 使用 kernel 的 `causal_bottom_right`，即便上游传入 attention mask，也跳过重复构造 `[curr_len,total]` dense adjusted mask；SFT/DSA 仍走显式 mask 分支。
+
+这减少的是特定 mask 物化，不改变 KV 固定槽/真实长度、RoPE、MTP 或完整训练显存的其他部分。验证保留非等长Q/KV、短尾块、checkpoint重算及SFT/DSA对照，检查可见历史与loss/梯度，而非只看显存下降。旧父子固定证据继续作为机制起源，本轮没有设备性能实测。

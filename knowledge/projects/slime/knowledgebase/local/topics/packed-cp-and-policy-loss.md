@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: thudm-slime
   path: slime/backends/megatron_utils/data.py
@@ -57,6 +58,11 @@ sources:
   path: slime/backends/megatron_utils/cp_utils.py
   commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 824139d155eb8041c67cf93f95c3d6a1fcb4d28191535edbe47566ab1be48af4
+- source: thudm-slime
+  path: slime/backends/megatron_utils/data.py
+  commit: 79aa41a884ab0bf65222c94418f6357d3c31192b
+  sha256: 4ad54bbd49045b60006a91807b92539086055785fec4d284c09ef0acaa855cff
+retrieved_on: '2026-11-18'
 ---
 
 # Slime：packed CP、策略 loss 与 sample/token 分母
@@ -109,3 +115,9 @@ packing减少padding和重复launch；CP延长可处理序列但引入远端atte
 ## 本轮补充固定证据
 
 - [tests/test_ppo_logprob_entropy.py](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/tests/test_ppo_logprob_entropy.py)
+
+## 变尺寸多模态输入与 packed 顺序
+
+`79aa41a884ab0bf65222c94418f6357d3c31192b` 的 batch 数据处理先按 key 收集，再对全部 tensor 检查 `shape[1:]`。非首维全部相同时才 cat；不同时向模型传 list，保留出现该 key 的样本顺序，缺少媒体的项不会凭空补成 tensor。消费方应检查 list/tensor 两条输入路线与 packed 媒体占位顺序、样本边界、logprob 和梯度；不能强行 cat 或依靠一次同尺寸输入的通过来覆盖变尺寸媒体。
+
+此改动不修改本页引用的 policy loss 归一化/entropy/recompute 公式，原 CP 与数值回归矩阵继续适用；本轮仅核对代码，没有运行设备测试。

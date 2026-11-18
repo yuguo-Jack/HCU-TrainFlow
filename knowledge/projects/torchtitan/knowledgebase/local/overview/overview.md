@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: README.md
@@ -62,6 +62,26 @@ sources:
   path: torchtitan/rl/generator/generator.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: fe3ccd0288aa613d11234607fa24e91e98953015dd75a49657da0b4c7dd56b01
+- source: pytorch-torchtitan
+  path: torchtitan/training_engine.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: ecbe72af3cdf4eba9d8093eb07c6178b2046063e87e574ed0d43f5861ab982ab
+- source: pytorch-torchtitan
+  path: torchtitan/config/configs.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: b35c74c3921b51c651f6f20633d2f38293f5b02d1d45af7b155bd285054a7207
+- source: pytorch-torchtitan
+  path: torchtitan/rl/controller/controller.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: e7111207a551e02c27b80dc4059b354353204dcbfb1d1af6ab54f423212c941b
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator/model.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: d0cd8f39610905786265c3b8926e33f23285533d9b1e1dc5013d411e78c7d7df
+- source: pytorch-torchtitan
+  path: torchtitan_recipes/rl/model_configs.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: fe0da78525a977441c3d762b4cbfef36485de6b9c206dd593e11cd9c3e55ff00
 ---
 # TorchTitan 官方工程：定位、能力边界与阅读路线
 
@@ -111,11 +131,11 @@ RL 的领域服务与 actor framework 分开：Controller 经 `ActorSystem` prov
 
 精度现在由根配置 `precision: PrecisionConfig` 统一传给引擎和 RL 两角色；`dtype`、`param_dtype`、`reduce_dtype` 分别描述基础存储、混合精度计算和归约。局部编译入口为 `model.local_compile: LocalCompileConfig`，Graph 配置/API 改名为 `accelerator_graph*`，源码仍明确拒绝 ROCm/HIP 路径。统一命名不等于新增 HCU 支持。
 
-恢复点与推理导出已分目录；RL trainer 不再持有整份 pinned CPU 权重镜像，generator 可选 CPU prefetch 或 GPU fetch。它们会改变主机峰值、暂停时间和异步所有权，需沿专题中的真实消费者验证，不能直接复用旧容量或耗时结论。
+恢复点与推理导出已分目录；2026-11-04 的 TorchStore 路线中 RL trainer 不再持有整份 pinned CPU 权重镜像；当前默认 transport 及 generator prefetch/gpu_fetch 的边界见本页增量。它们会改变主机峰值、暂停时间和异步所有权，需沿专题中的真实消费者验证，不能直接复用旧容量或耗时结论。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/README.md)
 - [RELEASE.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/RELEASE.md)
@@ -127,7 +147,7 @@ RL 的领域服务与 actor framework 分开：Controller 经 `ActorSystem` prov
 
 ## 本轮机制更新入口
 
-[并行与显存](../topics/parallelism-and-memory.md)更新 `activation_remat` 配置与惰性预处理；[编译与通信](../topics/compile-fusion-and-communication.md)区分共享 Graph pool、eval capture、逐 microbatch group 归约及已修复的 PP capture 四项输入链及剩余设备验证边界；[训练与数值](../topics/training-and-numerics.md)更新 PP loss kwargs/metrics 和首个 WGRAD dtype；[TitanRL](../topics/titanrl.md)更新 ActorSystem、model state dict transfer、FP32 LM head 与冻结 router 的默认。实际配置、模型 loss 与生成权重版本仍按同一上下文验收。
+[并行与显存](../topics/parallelism-and-memory.md)更新 `activation_remat` 配置与惰性预处理；[编译与通信](../topics/compile-fusion-and-communication.md)区分共享 Graph pool、eval capture、逐 microbatch group 归约及已修复的 PP capture 四项输入链及剩余设备验证边界；[训练与数值](../topics/training-and-numerics.md)更新 PP loss kwargs/metrics 和首个 WGRAD dtype；[TitanRL](../topics/titanrl.md)更新 ActorSystem、model state dict transfer、FP32 LM head 与关闭 load-balancing 的默认。实际配置、模型 loss 与生成权重版本仍按同一上下文验收。
 
 ## 本次补充的实现与测试依据
 
@@ -139,3 +159,16 @@ RL 的领域服务与 actor framework 分开：Controller 经 `ActorSystem` prov
 - [torchtitan/distributed/accelerator_graph.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/accelerator_graph.py)
 
 - [torchtitan/rl/generator/generator.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/generator.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+当前训练侧的容量与数值契约有三项变化：冻结参数可在 FSDP 前存入较窄 `param_dtype`，同时保留 `preserve_dtype_params`；按原始 CPU microbatch 估计逻辑 FLOPs，不能继续用固定每 token 值；RL 默认只关闭 MoE load balancing，router gate 继续训练。具体边界分别见[数值](../topics/training-and-numerics.md)、[容量](../topics/parallelism-and-memory.md)与[RL](../topics/titanrl.md)。
+
+默认 RL 权重传输改为 `ModelStateDictTransport`（NIXL；可选 Mooncake），重新引入 trainer pinned staging；显式 None 才走 TorchStore，`gpu_fetch` 仍要求这条旧路线。生成模型和逐 FSDP group 的 loader 已抽到 `rl/generator/model.py`。原“trainer 没有自有 CPU mirror”只适用所述 TorchStore 路线，不适合作为当前所有配置的容量结论。
+
+重算新增按原始 block FQN 的 `block_overrides`；FSDP current-stream unshard 是受限且默认关闭的取舍，local compile 则增加保留异步 collective autograd edge 的等待。HF 导出拒绝带冻结参数的模型，DCP 异步 staging 增加 optimizer-stream 依赖。新代码、来源测试设计与现场验证分别看，未运行上游或 HCU 测试。
+
+固定入口：[torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/training_engine.py)；[torchtitan/config/configs.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/config/configs.py)；[torchtitan/rl/controller/controller.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/rl/controller/controller.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

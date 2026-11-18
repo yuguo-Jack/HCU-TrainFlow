@@ -65,6 +65,8 @@
 
 先复用现场 Cluster Manager `stack-analyzer` 和已安装采集入口，核对其版本、PID namespace、rank 映射与采集权限。若使用 py-spy/pstack/调试器，先读实际帮助并评估 attach 停顿；没有预装 Python 信号处理器时，不发送猜测的 dump 信号。
 
+栈聚合的 `machines_to_evict` 是诊断建议，不是已隔离或已停止的证明；由唯一恢复 owner 结合真实成员和其他证据决定动作。NRE/HCU telemetry 是另一条可选采集路径，按[站点恢复器接入](../../../docs/operations.md#衔接站点恢复器)核对实际包、开关、依赖和 fallback；缺遥测不能直接归因为训练进程退出。
+
 ### 3.2 复核通信契约
 
 1. 对照**真实 process group**和其成员，核对 collective 顺序、类型、dtype、count、root、split sizes 以及 async work 的 wait/stream 依赖。PP send/recv 检查匹配的 peer、tag/顺序；all-to-all 检查发送与接收矩阵，不要求所有 rank 的数据形状相同。
@@ -172,6 +174,8 @@ RL 另对齐 policy/权重版本、rollout 样本及数据年龄、logprob/rewar
 6. **观察与告警：** 对照新 attempt 的真实进度、全部成员、watcher、独立 sentinel 与日志轮转/存储。outbox、桥接消费、飞书送达、Agent 接手、问题解除是不同状态。训练恢复后 watcher 仍失联时保留监控故障，不能只关闭训练异常。
 
 Primus Safe 等工作负载控制层还需分别验收训练资源、可选通知 CRD/client/Secret 和实际消息送达；作业已创建可能伴随通知创建失败。恢复关联 workload UID，避免同名重建混入旧事件。Ray 等镜像依赖按当前模板核对，不能依据旧日志假定会运行时安装；数据路径通过配置校验也不代表每个远端成员均可读。
+
+Ray 原生成功但训练分析未完成时，按项目[接入契约](../../../docs/operations.md#衔接站点恢复器)核对当前 Workload/RayJob UID、dispatch、最终原生 attempt 和已排干提交的分析结果。CRD 不存在的可选回退、有 CRD 却无 Session 的等待、API 错误分别处理；旧日志或未知故障字段不当 clean。确认故障后的重新派发使用同一剩余重启预算，仍须旧成员核销和完整 checkpoint 恢复，不把控制层成功判定当数值/训练目标已验收。
 
 ## 9. 收尾：恢复不等于根因已经解决
 

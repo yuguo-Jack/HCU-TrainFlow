@@ -9,8 +9,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: nvidia-megatron-energon
   path: docs/source/basic/task_encoder.md
@@ -44,7 +45,23 @@ sources:
   path: docs/source/basic/recipe.md
   commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: 5fed272cbe8dcc57c3767ab8e43214578ad2325c8d5314d32073eb5d84f97f71
-retrieved_on: '2026-11-04'
+- source: nvidia-megatron-energon
+  path: docs/source/advanced/packing.md
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 807ed86e4cb10264d8f604f7d0bd752c475924bdfbf0e23591d766cfa3857d22
+- source: nvidia-megatron-energon
+  path: docs/source/basic/recipe.md
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 30f724c7f0a33a4a9ab1810993bdb8ca975fd0ba87443240876471ff85cfaf66
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/task_encoder/base.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 53e8825432d392d36f5308d77dbbbbffb28a8a0ae96d018959e15fde5f641403
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/rng.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 23f5973dc29c5faaa6eb2f996e3e934a29fb6f7ef864310f4fa352e76469391a
+retrieved_on: '2026-11-18'
 ---
 
 # Energon：TaskEncoder、Packing 与确定性重放
@@ -82,6 +99,16 @@ Recipe 接替 MetadatasetV2 的公开配置入口，旧名称是弃用别名；�
 异常先重读encoder→pack→batch→训练loss链，退回普通padding/可信数据配方定位最小差异。变更TaskEncoder、dataset schema/混合/shuffle或消费者mask/loss时同时复核[总览](../overview/energon.md)和[恢复专题](energon-recovery-throughput.md)；不是encoder升级后直接复用旧checkpoint状态。
 
 2026-11-04 检索固定 `e33bbe768a4f7a629377a365c8af9a7b98b1219e`：本页八份引用原件字节均未变。重读 `TaskEncoder.build_batch` 的 packing override 检查、pre/final packer 与 stateless 标记传播，以及 `resolve_tags` / `canonicalize_tag_kwargs` 的新旧字段互斥，保留上述机制。总览的新 Recipe filter 是编码之前的样本集合选择，不能用 tags 兼容证明过滤前后数据分布、batch 身份和旧 restore keys 仍相同；实际自定义 encoder 与训练 mask/loss 仍需复核。
+
+## Streaming packing、partial sample 与分组混合
+
+固定 `8ba04a3aa4200725a136258e00a6facf3bd15acd` 的 `packing_buffer_size="stream"` 选择 pull-based `select_next_pack`，它和 `pack_selected_samples` 都必须由 TaskEncoder 实现；原整数 buffer 继续走 buffered selector。每次 streaming selector 最多返回一个非空 pack。`PartialSample(sample, slice)` 的 slice 含义由用户 encoder 解释，需可随 loader state/restore key 序列化；有 `postencode_sample` 时该方法必须同时接收完整/partial 样本，否则由最终 packer 应用切片。
+
+`PackedSamplesOutput.pushback` 将剩余样本前置，保持顺序；selector 失败或成功但没有非空 pack 时，本次已读取的样本及 pushback 会被丢弃。耗尽时应返回未满的末包才能保留其样本，不能把空返回当作无损等待。测试要覆盖切片余量、末包、异常和 mid-buffer 恢复，再核对训练 segment mask、labels 与 loss 分母。
+
+`build_packing_groups` 返回的各组不能为空、不能重复或遗漏输入 dataset，各组可使用不同 packing 策略，再将输出混合。默认 `blend_weight_unit="samples"`；自定义单位须同时核对 sample-stage metric 与组后 encoded-stage metric。每层嵌套 blend 单独声明一致单位，不自动继承。
+
+`@stateless(restore_seeds=True)` 的实际恢复范围是 Torch CPU、NumPy、Python RNG。`SystemRng.seed` 已从 `torch.manual_seed` 改为 `torch.random.default_generator.manual_seed`，设备随机性由自定义变换另行处理；decorator 仍不证明所有副作用可重放。
 
 ## 固定证据与复核范围
 

@@ -111,6 +111,8 @@ hcu-trainflow wiki-update PROJECT nvidia-megatron-lm --max-documents 40 --max-pr
 
 需要检查新增接口、目录或父 gitlink 时，用 `wiki-inventory PROJECT SOURCE --retain` 解析 ref 到固定 SHA 并获取完整树；它不是每次搜索或重构的必做项。truncated 失败，不据此推断删除。新/改/删路径进入私有 `wiki/inventory-pending/`，重复抓取不会清掉未处理项；已有未深读项继续保留原状态，不阻塞只负责发现入口的维护。
 
+登记源码读取返回404或失败本身不证明文件已删除。discovery-first 采集只在同一完整 commit 的未截断 inventory，或从该 commit 的根树逐级读取必要且完整的父树链，证明具体路径缺失后才记录 `proven-absent`；证明绑定仓库、commit、路径及原始树证据哈希。必要父树链不要求扫描整仓，也不越过 submodule/symlink 推断其目标缺失。树截断、身份不符、权限/网络失败或无法证明时仍保留 unavailable，不能伪造空文件或推进成功基线。已证明的移除仍进入作者页/工作流复核，历史固定原件和引用保留适用版本，新入口需沿实际消费者重新核对。
+
 `wiki-triage PROJECT SOURCE decisions.json` 分批记录路径处置；deferred 继续待处理。示例：
 
 ```json

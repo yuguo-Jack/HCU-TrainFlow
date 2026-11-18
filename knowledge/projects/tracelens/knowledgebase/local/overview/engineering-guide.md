@@ -7,8 +7,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
 sources:
 - source: amd-agi-tracelens
   path: setup.py
@@ -82,6 +82,58 @@ sources:
   path: TraceLens/Reporting/generate_multi_rank_collective_report_pytorch.py
   commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
   sha256: 0566e1ecf0606f7f39e22e99d1c264ea104ebee65f8e574b48d98f178338adf3
+- source: amd-agi-tracelens
+  path: README.md
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 08d2ec993bdf4f6a04d7aba669f50a042e09ff848ddbfe4a32ca62f43ca775de
+- source: amd-agi-tracelens
+  path: TraceLens/Agent/Analysis/utils/deterministic_fallback.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: d959598ee2aa2440485556e3b0ee6f22bbce80e2f0394ded200beb5fbff5f54e
+- source: amd-agi-tracelens
+  path: TraceLens/PerfModel/benchmarking/microbench.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: b99f5a86beae983273821807ea238b497efe042df40c859412d3434537e3ed55
+- source: amd-agi-tracelens
+  path: TraceLens/PerfModel/benchmarking/microbench_utils.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 773e21226eb198beb570313d3dfc1dcf5d55a9cae8eba38a2e61c0e179f69413
+- source: amd-agi-tracelens
+  path: TraceLens/PerfModel/extensions/moe_perf_model_extensions.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 16ac3c4b91c394dcc7efb84906ea59fb171e7d1cd17105de6eadd0da52f005dc
+- source: amd-agi-tracelens
+  path: TraceLens/Reporting/generate_perf_report_pytorch.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 75b82f531f645eb4d22870bb67707bab1c95d15147b22f536ed4097242dff9e1
+- source: amd-agi-tracelens
+  path: TraceLens/Reporting/reporting_utils.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: f91e56b2ee98aded09b0c849f4f59cf90e9b3cf7bee3ff5df7af55bf8597fd0a
+- source: amd-agi-tracelens
+  path: TraceLens/Trace2Tree/trace_capture_merge_experimental.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 886ed2dc04de7a21f71434fbc9da23699e1af43de3ce0c062569128d0cb74588
+- source: amd-agi-tracelens
+  path: TraceLens/Trace2Tree/trace_to_tree.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 847f9a6ed2bf43b704f102c95de923ca0451d7cb0497f416e3060f8b0e1fca0f
+- source: amd-agi-tracelens
+  path: TraceLens/TraceUtils/split_trace/main.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 0bf0d4473b8167a20f37e71ccfe072f52642e96ff9c2407d6d4028d368d61c42
+- source: amd-agi-tracelens
+  path: setup.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 268b667c54c9f345c4585e0f30b9be1ed9dce57366d9557b2eb5b21f36d33ddc
+- source: amd-agi-tracelens
+  path: tests/test_perfmodel_benchmarking.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 54b8359c1af5ef5b906bc30e5ed981d3ad7f3fe6a012e561666369d919e18a01
+- source: amd-agi-tracelens
+  path: tests/test_perfmodel_extensions.py
+  commit: 7bef4432661a9a5094b54828ce462ea375ede85c
+  sha256: 358d381e7044463e1f9e7087608f1b893cde271415e76a110d48a5780289b200
 ---
 
 # TraceLens 官方分析机制与阅读路线
@@ -94,15 +146,23 @@ sources:
 
 从[官方 README](../../upstream/docs/amd-agi-tracelens/README.md.md)和固定 `setup.py` 核对依赖与 entry points；原生 PyTorch 报告入口是 `TraceLens/Reporting/generate_perf_report_pytorch.py`。输入类型、输出选项和当前签名以[PyTorch 报告教程](../../upstream/docs/amd-agi-tracelens/docs/how-to/generate-perf-report-pytorch.md.md)及对应源码为准。先用完整、有限的已知 trace 核对事件数、单位、时间窗口及缺失关联，再使用报告解释训练性能。
 
-多 rank 通信使用[collective 教程](../../upstream/docs/amd-agi-tracelens/docs/how-to/collective-report.md.md)：保留 group/rank、消息量及同步等待，不能把不同通信域直接合并。训练步、optimizer、数据/保存活动是否在窗口内必须明示，GPU 时长和不能作为端到端墙钟。
+多 rank 通信使用[collective 教程](../../upstream/docs/amd-agi-tracelens/docs/how-to/collective-report.md.md)：保留 group/rank、消息量及同步等待，不能把不同通信域直接合并。训练步、optimizer、数据/保存活动是否在窗口内必须明示，GPU 时长之和不能作为端到端墙钟。
 
 ## 本固定上游的接口变化
 
-本次阅读固定在官方 `90f2f6f58210d1828c5eca6949b1dce7d2525fa7`，采集/复核日期为 2026-11-04。PyTorch `generate_perf_report_pytorch` 已移除 `python_path` 与旧 `enable_origami`，改为两个默认 False 的 `enable_origami_gemm` / `enable_origami_sdpa_tile`；CLI 分别为 `--enable-origami-gemm` / `--enable-origami-sdpa-tile`，仍要求合适的 GPU arch。GEMM 预测列和按 tile GEMM 建模的 SDPA 预测不同，不能把预测时间当作实测或混合使用旧参数。
+当前复核固定在官方 `7bef4432661a9a5094b54828ce462ea375ede85c`，日期为 2026-11-18；此前 `90f2f6f58210d1828c5eca6949b1dce7d2525fa7` 的来源仍保留。PyTorch `generate_perf_report_pytorch` 已移除 `python_path` 与旧 `enable_origami`，改为两个默认 False 的 `enable_origami_gemm` / `enable_origami_sdpa_tile`；CLI 分别为 `--enable-origami-gemm` / `--enable-origami-sdpa-tile`，仍要求合适的 GPU arch。GEMM 预测列和按 tile GEMM 建模的 SDPA 预测不同，不能把预测时间当作实测或混合使用旧参数。
 
 extension loader 新增 `external_op_projection`，以及必须为 dict 的 `op_projections` / `kernel_filters`，逐 label 注册；原有 tree postprocess、perf model 和类别 hook 仍有各自作用。extension 是可执行 Python，固定来源和适用版本，不能把动态注册结果当作所有算子的默认模型。
 
 `setup.py` 新增 config-driven report、model explorer visualizer 和 model roofline projection entry points，以及单独的 `Visualizer` extra。entry point 存在只证明注册；其依赖、配置 schema、静态模型预测与目标硬件能力还需沿具体实现核实，本轮没有安装或运行。现用 HCU fork `22786b16d429783927981bd592a47ad0f79db3ba` 仍使用自己的固定签名，不能把这些新参数直接透传，也不据官方上游变化升级依赖锁。
+
+## 新增 idle 诊断与安装副作用
+
+PyTorch report 新增 `enable_idle_analysis`、`enable_augmented_trace` 和 `idle_launch_latency_us`，前两项默认关闭。启用 idle 后增加 idle overview/groups/intervals；augmented trace 也须在 idle 路径中生成。launch latency 是分析输入的阈值，不是目标 HCU 的实测延迟或端到端瓶颈证明；对输入缺失和跨 rank 等待仍保留未知。`include_call_stack` 对 idle interval 的同步和覆盖调用栈有独立含义，不把一个调用栈直接当作因果归属。
+
+报告调用 `trace_check.run_trace_checks(..., pre_report=False)`，输出层可写累计检查 JSON；无架构参数时 `reporting_utils.resolve_gpu_arch` 发出日志并省略 Roofline，不选择默认 GPU。诊断日志、检查文件、非空表与完成内容复核是不同状态。现用 HCU fork 的 worker 尚未接入这些新增参数/产物；上游检查不能代替现用版本的 warning/缺样和训练资格门禁。
+
+当前 `setup.py` 在构建元数据时调用 `_extras_require()`，其中为 Visualizer 查询 PyTorch CPU wheel 索引并选择 Python/平台对应 URL，读取失败会报错。因此仅查询或构建该上游版本的安装元数据也可能需要访问该索引；不能把它当作与旧版相同的离线安装过程。本轮只读源码，没有安装 Visualizer、获取 torch wheel 或改变现用依赖。
 
 ## 机制与性能判读
 
@@ -124,17 +184,23 @@ MoE performance model 必须按具体类确认计算精度：W4A16 GPTQ/AWQ 用�
 
 新增 `moe_opus_stage1_a8w4` 从 packed FP4 权重、scale 与输出形状推导工作量，shape/dtype 不足返回无性能值；活跃专家数仍使用均匀路由的期望估计。`SglangMoeSortingSmall` 区分 compact/distributed 整数排序，`moe_sorting_opus_fwd` 只计实际可能写入的 padded slots、可选 moe buffer/workspace；非 dense 或无法识别的 tensor/布局保留 None。logical batch、捕获 padding、实际 routing 和整数操作不同于 dense GEMM FLOPs，报表比较要固定模型类与这些假设。
 
+MoE 字节模型改用公共 `name2bpe`。当模型已将 K 解包为逻辑值数时，`Float4_e2m1fn_x2` 每逻辑权重取半个字节；仍使用 traced packed-K 的 SGLang 模型保留存储元素宽度，不再额外除二。计算精度与存储宽度继续分别判断；未知 dtype 的处理依具体模型是拒绝、返回空性能值或明确 fallback，不能用一条统一宽度规则覆盖所有类。对应回归中包含 packed dtype/输入别名的检查，本轮未运行这些上游回归。
+
+vector FMA microbench 的 block 改为按 `gcnArchName` 的 gfx target 选择，gfx942/1151/1201 显式登记，未登记目标回落到 2048。这个 launch 配置及按 wave32 推导的注释不是 HCU 最佳配置或架构资格；校准仍保留目标设备、实际计算精度、shape 与测量范围。
+
 ## 多节点降级报告与 split/merge
 
 deterministic fallback 的 Graph coverage gate 现在逐 `node` 计算并采用最差节点，避免一个完整 trace 掩盖另一个节点的缺失。多 trace 报告按 node/op 聚合，门限和 heuristic impact 以各节点时间总和为分母，表内显示本节点占比；Executive Summary 的 Total 是 **node times 的和，非分布式 wall time**。它依赖相邻 `gpu_timeline.csv` 获取每节点时间，对不等长窗口尤其要核对。降级报告只恢复 kernel name/time 等有限项，不能补造 shape、分类或效率，更不能把 heuristic impact 当作实测收益。
 
-官方 split 新增进程内 `split_and_enumerate(...)` / `run(Namespace)`，返回与 execution_details 文件同形的列表，没有提取结果返回空列表；仍会写输出。iteration extraction 同时认可 preferred annotation pattern。现用 HCU fork 是否具有同样 API 需按固定接口确认，不能由函数名相似假定兼容。
+官方 split 新增进程内 `split_and_enumerate(...)` / `run(Namespace)`，返回与 execution_details 文件同形的列表，没有提取结果返回空列表；仍会写输出。iteration extraction 同时认可 preferred annotation pattern。现用 HCU fork 是否具有同样 API 需按固定接口确认，不能由函数名相似假定兼容。 当前 split 与 experimental capture loader 共用 `DataLoader.load_trace_events` 处理事件/元数据，capture loader 传入实际 capture folder 和 framework；不能只检查文件能解析就称捕获恢复完整。
 
 experimental capture merge 现在按 target/draft 等 role、batch size、FULL/PIECEWISE 和可用 replay rank 选择 capture；同 key 可有多个文件，SGLang request batch 与 tensor batch 可带 multiplier。先尝试单源位置配对，再按 dispatch count 精确或最近匹配，并按 dominant count 推断 mode。最近匹配是启发式恢复，不能保证 capture 与 replay 真实语义一致；缺 role/batch/源文件、跳过 root、数量差异和 warning/日志必须留作不完整证据。合并后的关联不是原 profiler 已记录的事实，应保存原 trace、capture metadata、匹配方式与失败项。
 
+`trace_to_tree.covering_user_annotation` 现在选择包含整个事件的最紧范围，优先带可解析 sq/sk 的迭代 annotation，并接受事件终点恰好落在 annotation 终点。该选择服务上游事件归属及推理模型的逻辑长度解释，不恢复真实训练状态；TraceLens 训练 Graph 仍须独立满足固定 capture/replay、事件计数和 stream 契约。
+
 ## 未变机制与验证范围
 
-本轮复核的 collective report/tutorial、compare report/回归、FP4/6 microbench helpers/回归与 `trace_to_tree.py` 固定对象未变；其 rank/group、缺表显式请求、tile 失败与事件关联门禁继续成立。报告接口、MoE 模型、fallback 和 merge 的变化分别按当前源码解释，没有运行上游测试、GPU replay、微基准或真实多节点训练。PR 讨论覆盖以独立采集回执为准，不由本页源码阅读代替。
+本轮复核的 collective report/tutorial、compare report/回归与 FP4/6 microbench helpers 固定对象未变；其 rank/group、缺表显式请求和 tile 失败门禁继续成立。deterministic fallback 的变化主要是共用名称截断及降级比例/阈值显示，不改变逐 node 最差 coverage 和 node-time 分母。报告、MoE 字节模型、annotation 与加载路径分别按新固定源码解释；没有运行上游测试、GPU replay、微基准或真实多节点训练。普通 PR 继续只做有界发现，不由本页源码阅读宣称历史讨论完整。
 
 ## HCU 消费方与更新
 

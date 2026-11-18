@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan_recipes/overrides/kimi_attention_residual.py
@@ -38,7 +38,22 @@ sources:
   path: torchtitan/distributed/local_compile.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 258d7980f3a28c310d0fb1a31319c4124677de921de573d6fd22878879a96f93
-
+- source: pytorch-torchtitan
+  path: torchtitan_recipes/overrides/kimi_attention_residual.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 8979be57c8330255160a43a95d256d8a447b1d95350f299944cc178803c6936f
+- source: pytorch-torchtitan
+  path: torchtitan/models/kimi_k3/model.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 193d30294ad0f71c9db8ebd7a1be3e48464622dd0b5a3631e723cd38407b509f
+- source: pytorch-torchtitan
+  path: torchtitan/models/kimi_k3/flavors.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 0f8966ae361475e48d98e72006ec994fc137ad0a9fe92849f0ee3eb98e7b4bc1
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/local_compile.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: b58a3f07b2851535630ec46413df47890d4b13922e65c405f65334a4739652eb
 pr_sources:
 - pr-pytorch--torchtitan-5033
 ---
@@ -84,17 +99,17 @@ PR 作者报告 H100、BF16、`T_local=2048, N=8, D=7168`、包含 partial 的�
 
 ## 本轮调用者复核
 
-当前固定提交中，Triton override及两个直接数值/编译测试的内容指纹未变，保留上述历史实验与算法分析。调用者并未保持原样：Kimi block已继承统一TransformerBlock，KDA/MLA放在同一attention字段，dense/LatentMoE放在feed_forward；MLA类移至attention.py，remat配置也改名。AttentionResidual本身仍在model.py，不能因其他class搬移就宣称该融合删除或自动扩大支持。
+当前固定提交中，当时 Triton override 及两个直接数值/编译测试的内容指纹未变，保留上述历史实验与算法分析。调用者并未保持原样：Kimi block已继承统一TransformerBlock，KDA/MLA放在同一attention字段，dense/LatentMoE放在feed_forward；MLA类移至attention.py，remat配置也改名。AttentionResidual本身仍在model.py，不能因其他class搬移就宣称该融合删除或自动扩大支持。
 
 Kimi构造器的默认attention backend改为varlen，DistMuon compute layout显式BF16；复现实验须固定这些新条件和重算策略，历史Flex/SelectiveAC窗口与当前默认不再可直接混比。只有确认实际override仍命中、所需residual-bank布局与梯度合同未变，才复用该案例；本次未重复上游性能或训练实验。
 
 ## 当前调用者复核
 
-Attention Residual override 的算法/核函数与直接 override 测试内容未变；原先独立 kernel 对比端到端的结论保留为历史实验。模型侧 `local_compile` 现在由 `LocalCompileConfig(regions=["attention_residual"]).apply()` 绑定，GPU local-compile 测试也使用该配置对象，清理时以空配置重新绑定。外围 Kimi MLA、CP/loss kwargs 和精度配置已有变化，不能由局部 kernel 未变推断当前整模型性能或 HCU 兼容已验证。
+Attention Residual override 的算法/核函数与直接 override 测试内容未变（本轮另删除性能 docstring）；原先独立 kernel 对比端到端的结论保留为历史实验。模型侧 `local_compile` 现在由 `LocalCompileConfig(regions=["attention_residual"]).apply()` 绑定，GPU local-compile 测试也使用该配置对象，清理时以空配置重新绑定。外围 Kimi MLA、CP/loss kwargs 和精度配置已有变化，不能由局部 kernel 未变推断当前整模型性能或 HCU 兼容已验证。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan_recipes/overrides/kimi_attention_residual.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan_recipes/overrides/kimi_attention_residual.py)
 - [torchtitan/models/kimi_k3/model.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/kimi_k3/model.py)
@@ -104,3 +119,14 @@ Attention Residual override 的算法/核函数与直接 override 测试内容�
 
 - [PR #5033：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5033.md)
 - [torchtitan/distributed/local_compile.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/local_compile.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+Triton override 本轮仅删除 docstring 中的历史 benchmark 概述，kernel 与直接 override/模型测试没有改变；保留原 PR 的固定数字与许可来源。模型 eager/reference 的加权聚合则从 matmul 改为逐项乘后按来源求和，浮点归约顺序可能变化，不能把旧 eager/compile 数字或 bitwise 关系自动延续到新比较。
+
+Kimi 现分 text 与 `_mm` 类/flavor，并加入新的 MLA compile region；local compile 对 async collective 输入还通过带 autograd edge 的 wait wrapper。复用融合时重新确认实际模块、residual-bank/partial 布局、当前参考与全部梯度，仍以模型整步和阶段 loss 决定保留。该变化未将历史独立算子收益变成当前整模型/HCU 通过。
+
+固定入口：[torchtitan_recipes/overrides/kimi_attention_residual.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan_recipes/overrides/kimi_attention_residual.py)；[torchtitan/models/kimi_k3/model.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/kimi_k3/model.py)；[torchtitan/models/kimi_k3/flavors.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/kimi_k3/flavors.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

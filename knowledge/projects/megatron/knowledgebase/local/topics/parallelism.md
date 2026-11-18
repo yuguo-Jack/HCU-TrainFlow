@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/parallel_state.py
@@ -55,12 +55,54 @@ sources:
   path: megatron/training/config/container.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: 4965eeb1ad25b950348a29557799fd920f1c2207544c83992eb22e537a8758b2
+- source: nvidia-megatron-lm
+  path: docs/user-guide/features/context_parallel.md
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 634913546f01e990d4a9bdabb2460ff50fd003335020982b6774a21c53ec0d82
+- source: nvidia-megatron-lm
+  path: megatron/core/parallel_state.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 72b099752dd73135d3608947593a56539249cb20e43e5359fa4b5a5621db7e62
+- source: nvidia-megatron-lm
+  path: pretrain_gpt.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 1ba21dabb7284799ec1e7b2e37475e4037f8940452d6d40615d5eeba049c9a40
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/multi_latent_attention.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 4d08649f45e99d958a416bf28a530976cc83551d61c76fccdb5b656515b8e480
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/multi_token_prediction.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 7fcf8b2dd9f1f42a7a64e947758dc83ebd22f0b9a06e044cef4d29b8e026de78
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/transformer_config.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 5470c5ca64aad696089ba9503f588c89d33669df05682d51e0d01bda705ca16e
 kind: authored
 retrieved_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 ---
 
 # 并行域、微批与 rank 采样
+
+## 2026-11-18：动态 CP 与所属 process group
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+动态 CP 按每个 packed microbatch 的序列选择 group，建模时的 group 不因此被全局改写；可选最大范围来自 DP×CP domain，当前没有独立 max-size 参数。官方入口组合要求 variable-length data、`default_dynamic_cp` packing、per-token loss 和每 rank token 容量；不支持 deterministic mode、CUDA Graph、router z-loss 或 DeepSeek-V4，CSA/DSA-GQA 也不在支持范围。头/组几何必须能被调度器可能选择的每一种 CP 大小整除，不能只验证启动时的静态 CP；模型和 attention 分支的实际门禁继续以当前配置校验为准。
+
+`pretrain_gpt`、MLA、MTP 和 TE attention 把运行期 CP/TP×CP 交给所属 metadata/group。新 `parallel_state` 说明要求新功能显式传组，global accessor 和 `use_mpu_process_groups()` 只留兼容范围；独立模型 grid 不能使用另一个模型的全局 rank。组变化还影响 label roll、mask/RoPE、token count、RNG和梯度归一化，先做同数据跨布局的数值对照，再测扩展收益。推理仍是 CP1，不因训练支持动态 CP 推出演化出 CP inference。
+
+### 本节固定证据
+
+- [docs/user-guide/features/context_parallel.md](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/docs/user-guide/features/context_parallel.md)
+- [megatron/core/parallel_state.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/parallel_state.py)
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/pretrain_gpt.py)
+- [megatron/core/transformer/multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/multi_latent_attention.py)
+- [megatron/core/transformer/multi_token_prediction.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/multi_token_prediction.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/transformer_config.py)
 
 ## 需要显式建模的拓扑
 

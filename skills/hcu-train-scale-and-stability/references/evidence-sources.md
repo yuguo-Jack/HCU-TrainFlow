@@ -1,6 +1,6 @@
 # 排障的知识检索与源码查证
 
-诊断指南的参考复核日期：2026-11-04（HCU-Knowledge `c08470f7c1032f8ad9f072a161c687d2a6b50a3b` / `v0.5.7`）。以下 ID/路径属于独立的 **HCU-Knowledge**，不是本 Skill 安装目录；按 `$hcu-knowledge-search` 的 `workspace.json` 找实际 KB_ROOT。路径只是导航，最新索引与当前部署版本须另核对。不复制内部原始材料到公开 Skill，也不因查询触发全库更新。未变的手册/固定测试继续复用，其原硬件验证日期不因本次阅读而刷新。
+诊断指南的参考复核日期：2026-11-18（HCU-Knowledge `a3a5be59183d564e54897e8a653604be8c91d505` / `v0.6.3`）。以下 ID/路径属于独立的 **HCU-Knowledge**，不是本 Skill 安装目录；按 `$hcu-knowledge-search` 的 `workspace.json` 找实际 KB_ROOT。路径只是导航，当前部署版本须另核对。不复制内部原始材料到公开 Skill，也不因查询触发全库更新。未变的手册/固定测试继续复用，其原硬件验证日期不因本次阅读而刷新。
 
 ## 按问题查证
 
@@ -40,10 +40,11 @@ python -X utf8 <KB_ROOT>/kb.py --root <KB_ROOT> search-pr "graph proxy hang" --p
 
 当前来源的差异决定怎样查证，不能只按项目名取最新文件：
 
-- **RCCL**：当前 HCU `develop@bffc76ada18fefdc03fdbc1d5f9352a75537e4da` 保留双 P2P 连接预连接修复，另有跨 host 拓扑身份和路径变化。跨连接、跨节点及 Graph 故障需保留连接选择、融合拓扑与真实 communicator 证据。MR153 的 PCIe 清零修复仍为候选，不能把全零 BF16/NaN 问题写成已修复。
-- **Cluster Manager**：当前公开 `main@1e54471b5b0f4e8401596f519b9632c5de8cff11` 的训练恢复器位于 `hcu-training-reliability/`，Python 包仍为 `cluster_manager`，命令仍为 `hcu-cluster-inspect`。沿 `runtime_context.py::handle_runtime_fault`、`job_state_machine.py::_handle_log_exit` 和 `distributed_job_manager.py::_stop_training` 查 MPI 映射、人工介入与停止失败分支；不能由目录迁移推断恢复已安全。接入门槛见项目 `docs/operations.md`“衔接站点恢复器”。
+- **RCCL**：本次固定 DTK `develop@bafb6ac5f5f369afe5abf2d4e9b3ed8314044300`，HSW 跨 host P2P 已回到拓扑检查并尊重用户 level/disable 约束，P2P channel 上界与 crossNic 搜索也有变化；旧“HSW 总绕过检查”不能用于诊断。双连接预连接、融合拓扑、实际连接与 Graph 分支仍分别采证。此前 MR153 的 PCIe 清零候选不因这些拓扑改动而视为修复，采用前核对该 MR 的实际状态与固定树；不能用旧 811 表标签或独立峰值拼接本次实测。
+- **Cluster Manager**：固定 `main@ea2a1d1e95f3c524bcf1fdf74d382ec351ea8e3b` 的训练恢复器仍位于 `hcu-training-reliability/`，import 为 `cluster_manager`，命令为 `hcu-cluster-inspect`；`launcher/container_ssh.py` 和 Docker/MPI launcher 已使用独立容器 Ed25519、受管授权块与 known_hosts，并传播 `clush -S` 失败。替补容器复用同一准备链，coordinator↔peer 探测不等于全连接训练验证。可选 NRE 工程根为 `nvidia_resiliency_ext/`，适配 import 仍为 `hcu_resiliency_ext`；父 gitlink `0f034639db696ecd4b43311c63f7a0e693aa4d75`、包装器 `hcu-resiliency-ext==0.1.0` 与 `nvidia-resiliency-ext>=0.7,<0.8` 声明、组合 wheel 实际版本各自核对。跳过 CUPTI 扩展不证明其余 CUDA 依赖均已禁用；telemetry 的显式开关优先级、依赖回退和真实接管另验。`controller/distributed_job_manager.py::_stop_training` 与此前保留原件字节一致，停止失败仍可能推进 STARTING，不能由 SSH 修订推断恢复已安全。详细入口为 `cluster-manager-engineering-handbook`、`cluster-stack-resiliency-analysis`；接入门槛见项目 `docs/operations.md`“衔接站点恢复器”。
+- **Primus-SaFE**：固定内部主线 `57339bb48281e599e358fda4733bf209faa06994`，沿 `primus-ray-shared-retry-budget` 与 `SaFE/job-manager/pkg/syncer/ray_success_review.go` 检查成功复核：当前 UID/dispatch/最终 native attempt、Sealed Session、无 pendingTransaction、version=1、complete=true、submission/cluster/nativeRetries 一致及布尔 hasFault。CRD 不存在、Session 待排干和 API 错误不同；确认故障的 fallback 仍扣共享持久预算，不能额外获赠一轮。`docs/examples/{pytorchjob,rayjob}/` 的 `maxRetry:0`、空镜像归档目录的跳过语义与已有 release 升级分别核对，不能把示例或脚本运行成功当部署/恢复通过。
 - **Probe**：当前公开主源是 `HYGON-AI/hcu_probe-das` 的 `26.2.0-dev@1cf9e49686a2d3f61aca42ef110fdd1ac9660ffa`；内部 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5` 保留历史机制证据。distribution 为 `hcu-probe`，import/CLI 为 `hcuprobe`，入口为 `hcuprobe.cli:main`。公开 `tools/compare.py` 的旧 namespace 已修复，precheck extra 已登记实际依赖；不再沿用旧包装器失效或 extra 缺失结论。核心 hook/service/collector/compare 的对应固定文件未变，异步快照、flush、缺失实体张量和空匹配限制继续保留。入口修复不等于所有 backend 或现场采集通过。
-- **PyTorch**：常用 2.13 维护线与 2.16 专项线分开；内部专项 `main@c55e238d4b1c03e04d2b37c4642ed10d0117b929` 的 Graph RNG、retained 对象与 allocator 恢复变化不能直接套到 2.13 wheel。`USE_ROCM` 对指定原地址的 expandable segment 恢复明确拒绝；代码存在与测试跳过均不是 HCU 功能通过，按项目 `docs/training-state-validation.md` 补受影响验证。
+- **PyTorch**：常用 2.13 维护线与 2.16 专项线分开。本次 2.13 masked-FA 固定证据为 `bd0bddedc542c4813382e94aef3744b6fc6a2476`，应读实际 attention 分派、SDP 条件与对应测试；版本登记或源码存在不代表所有 mask/精度/反向路径均已实测。既有 2.16 专项 `main@c55e238d4b1c03e04d2b37c4642ed10d0117b929` 的 Graph RNG、retained 对象与 allocator 恢复边界继续保留，不能套到 2.13 wheel。`USE_ROCM` 对指定原地址的 expandable segment 恢复明确拒绝；测试跳过不是 HCU 功能通过，按项目 `docs/training-state-validation.md` 补受影响验证。
 
 上述提交**不是工作流依赖锁或推荐部署版本**；现场另行固定。大库已记录的未合入 PR、历史快照与已部署的自定义分支分别检查；本次只有文档/源码审阅，没有 HCU 调试、采集或恢复实测。
 
@@ -52,7 +53,7 @@ python -X utf8 <KB_ROOT>/kb.py --root <KB_ROOT> search-pr "graph proxy hang" --p
 - [PyTorch distributed 调试](https://docs.pytorch.org/docs/stable/distributed.html)：组/成员、调试日志和 Gloo `monitored_barrier`。先核对 HCU PyTorch 实际实现，不能直接把 stable 文档所有能力当成本机已有。
 - [PyTorch memory snapshot](https://docs.pytorch.org/docs/stable/torch_cuda_memory.html)：追分配生命周期；它只能看到 allocator 管理的内存，库外直接分配需另查。HCU 构建能否使用相关 API/可视化由现场确认。
 - [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)：主机/容器限额与 memory.events；读取实际进程所属层级和时间增量。v1 环境用对应内核文档，不照搬 v2 路径。
-- [Cluster Manager 固定源码](https://github.com/HYGON-AI/cluster-manager-das/tree/1e54471b5b0f4e8401596f519b9632c5de8cff11)：按部署子工程追控制与恢复；用现场版本比较该参考快照。
+- [Cluster Manager 固定源码](https://github.com/HYGON-AI/cluster-manager-das/tree/ea2a1d1e95f3c524bcf1fdf74d382ec351ea8e3b)：按部署子工程追控制与恢复；用现场版本比较该参考快照。
 - [Probe 固定源码](https://github.com/HYGON-AI/hcu_probe-das/tree/1cf9e49686a2d3f61aca42ef110fdd1ac9660ffa)：核对实际 wheel、CLI 分派、配置与采集/比较消费者，旧命名文档不覆盖当前实现。
 
 ## 如何维护这些方法

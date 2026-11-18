@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: selected mechanisms, recipes and tests at pinned official source; not every
+  model/backend and no HCU runtime execution
 sources:
 - source: deepspeedai-deepspeed
   path: README.md
@@ -117,6 +118,51 @@ sources:
   path: deepspeed/sequence/vocab_parallel_ops.py
   commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
   sha256: 6e1dd4cfb9d6442a238d026f9f01f16407cb830b8082351d4843ce18a6f3d749
+- source: deepspeedai-deepspeed
+  path: accelerator/cuda_accelerator.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 7f1cb7fa1a963579f2f5efbd3a0d9dc3cbf5bb616ec263cd9a17ad0086f30559
+- source: deepspeedai-deepspeed
+  path: deepspeed/ops/adam/cpu_adam.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 8af512c18359b51668bb02392ef851f1e3539d30e030c9c518157c4fabd10767
+- source: deepspeedai-deepspeed
+  path: op_builder/builder.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: ed7bc4f19bb45865e62b83f176e3f6c9581902954d29b166c9ac432ae03bb322
+- source: deepspeedai-deepspeed
+  path: docs/_tutorials/advanced-install.md
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 83fd0ca27c636301a9a112c1fda259d762cfe8852ffa5683b6699f37bbc49e93
+- source: deepspeedai-deepspeed
+  path: setup.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: a49a3ca46c6a85d6c3176e20d34a35eed85daa744b5d89c84981e1de08e04570
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/engine.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 97cf4fac9f0cfdb1e1ac5a289d2a4ec312843274c4c1c08bb6e8c1225c9de75e
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/config.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 34033db3576399499f67ed1b37d90c279a0506dd2b5bddda1715f3c189592f73
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/stage_1_and_2.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 61e0f21a348f3c98c44c32225ab25e1beddced12f36388a578acb1a608a8a454
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/stage3.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: d0abe8464970a378791847f64599395a26fbf5cca830676d9dffb4da5ddea1e3
+- source: deepspeedai-deepspeed
+  path: deepspeed/sequence/vocab_parallel_ops.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 679c4773a88edaa2139f64b9d5793c4361280bbecf851e8cc4a23fa3f1fee7b5
+- source: deepspeedai-deepspeed
+  path: tests/unit/checkpoint/test_fp32_master_only.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 205e583a6b0ff43742ab29b160f927ff52cc90d705f39df10b11e52e6af19b28
+retrieved_on: '2026-11-18'
 ---
 
 # DeepSpeed：训练引擎、ZeRO、流水线与恢复工程指南
@@ -125,7 +171,7 @@ sources:
 
 DeepSpeed 接管模型训练的梯度累积、优化器、分布式状态和部分执行调度，既是其他引擎的后端，也是可以直接集成的训练引擎。它通常不替调用方决定 tokenizer、模型结构、样本 mask 或任务 loss。训练入口成功并不代表模型配方正确。
 
-2026-11-04 复核官方 master 固定 `d8241a9ba266405e1a58fadf19e24b2370f6d7fa`，HCU 执行时仍以已验证的 HCU 分支、Torch/DTK 和扩展为准。CUDA Accelerator 这个类名不等于硬件只能是 NVIDIA，也不构成 HCU 支持承诺；确认实际 `get_accelerator()`、`torch.version.hip`、编译产物和加载路径。官方源码用于比较机制与版本差异。
+2026-11-18 复核官方 master 固定 `5420b75de3226e95b6412ed2d95380c0a819c89a`；2026-11-04 的 `d8241a9b` 固定证据继续解释未变机制和历史用法，不冒充所有新路径的依据。HCU 执行时仍以已验证的 HCU 分支、Torch/DTK 和扩展为准。CUDA Accelerator 这个类名不等于硬件只能是 NVIDIA，也不构成 HCU 支持承诺；确认实际 `get_accelerator()`、`torch.version.hip`、编译产物和加载路径。官方源码用于比较机制与版本差异。
 
 ## 2. 工程目录和问题入口
 
@@ -156,6 +202,10 @@ CPUAdam/CPUAdagrad/CPULion 的 builder 已集中到 `op_builder/cpu/`。CUDA acc
 
 当前 CPU builder 对 RISC-V 架构名做大小写/下划线归一，并只在明确V版本或kernel HWCAP证明时启用 RVV；裸ISA字母v不够，避免把draft V当V1.0。这是CPU编译分支，不改变HCU gfx/设备扩展门禁。CUDA accelerator的具名NVTX域改走顶层 `nvtx.push_range/pop_range`，也不等于HCU已有相同profiler事件。
 
+当前 [`op_builder/builder.py`](https://github.com/deepspeedai/DeepSpeed/blob/5420b75de3226e95b6412ed2d95380c0a819c89a/op_builder/builder.py) 将纯 C++ 与设备 builder 分层：CPU optimizer 和 CUDA accelerator 中的 AsyncIO 属于 host builder，不应为了构建它们强制补装 CUDA。预编译与 JIT 共用各自 `extra_compile_args`，设备工具链校验留给对应子类；这不免除 Torch/扩展 ABI、host ISA 和实际 `load()` 验收。NVIDIA 的 arch parser 接受数值 CC、`a` 和 `+PTX`，拒绝 `Ampere` 这类名称；JIT 优先保存的显式 arch 列表，bad-fork 无显式目标会报错而非探测 CUDA。它与 ROCm/HCU 的 gfx 选择是不同命名空间，不能套用为 HCU 架构开关。
+
+CPUAdam 第一次构造时会在 `OMP_NUM_THREADS=1` 且每本地 rank 可用核心数不少于 2 时告警，包含 torchrun 默认设置带来的情况。先测 CPU 配额/亲和性、NUMA 和并发作业，再在任务范围比较线程数；不将“增加线程”写成所有 offload 场景的默认修复。
+
 ## 4. 运行与分层验收
 
 [Getting Started](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/getting-started.md)给出 `deepspeed.initialize` 和 launcher/JSON 配置。普通 engine 的基本循环是 `loss = engine(batch)`、`engine.backward(loss)`、`engine.step()`；engine 内部处理 accumulation boundary，调用方不能再次独立 `optimizer.step()` 或重复缩放 loss。Pipeline 模型使用自己的 `engine.train_batch(data_iter=...)`，见专题。
@@ -182,6 +232,8 @@ Engine显式拒绝 fused_linear+ZeRO-3（head forward结束后权重已释放）
 
 vocabulary-parallel logprob/entropy/KL 仍返回逐token结果，mask和目标归约归调用方；当前按 `HAS_TRITON && is_triton_supported && on_accelerator` 分发融合Triton，否则使用有界行块eager。全-inf分布返回NaN而梯度置零等边界不能靠选择新kernel改变；源码分发和上游性能注释不构成HCU正确性/收益证据。
 
+新增 [`vocab_parallel_jsd`](https://github.com/deepspeedai/DeepSpeed/blob/5420b75de3226e95b6412ed2d95380c0a819c89a/deepspeed/sequence/vocab_parallel_ops.py) 返回 FP32 逐 token generalized JSD，teacher/student 必须有相同 shape、设备、TP group 与有序词表分片，各 TP rank 反传同一 loss。内部 `0<beta<1` 使用混合分布，而端点 `beta=0/1` 分别约定为两个方向的 KL，**不是内部公式的连续极限**。温度、mask、归约及温度平方因子仍归调用方，两个输入都可收到梯度，需显式 detach teacher；它不融合 head projection，也不提供 top-k/clipping。该 op 的 XPU Intel-Triton 特判与全局 accelerator 能力分开，不能扩张为 HCU 全库支持或取消既有 undefined-row 检查。
+
 ## 6. 从配置到执行的调用链
 
 `deepspeed.initialize` → 解析配置/初始化进程组 → `DeepSpeedEngine` 或 `PipelineEngine` → 配置基础 optimizer/precision wrapper → 相应 ZeRO optimizer → hooks、bucket 和分片存储 → 通信/设备扩展。
@@ -199,6 +251,8 @@ ZeRO-3 的 module hooks 进一步进入 coordinator：按当前模块获取参�
 
 本轮 ZeRO-1/2 的 FP32 累积链有重要修订：低精度参数的梯度不应在归约后先截断回 BF16 再累积。当前实现保留 FP32 collective 结果并写入 owned local FP32 partition，动态 offload/reload 也重建共享 views；见[ZeRO 专题](../topics/zero-state-lifecycle.md)。`grad_accum_dtype`、通信 dtype 和参数 dtype 是三个边界，配置写成 FP32 不足以证明整条链保留了精度。
 
+2026-11-18 的共享 ZeRO-1/2 实现进一步用懒分配 host partition、未发布参数 ID 和 host-owned compact partition 跟踪非连续参与的累积窗口。`retain_gpu_grad_partition_until_step` 可在适用分支保留设备梯度，但当前代码在判断这个开关前仍复制 host 梯度；不能宣称它消除了所有 D2H。ZeRO-3 另有受限的 CPUAdam fused scale/BF16 分块回传、FP32 参数分桶和销毁清理，均需单独核对准入、额外 pinned 内存和完成事件，详见[ZeRO 生命周期](../topics/zero-state-lifecycle.md)。
+
 ## 8. 诊断、恢复和回退
 
 | 症状 | 优先证据和复核 |
@@ -211,7 +265,7 @@ ZeRO-3 的 module hooks 进一步进入 coordinator：按当前模块获取参�
 
 保存和加载属于分布式操作，参与 rank 必须遵守 engine 格式和相同调用顺序。ZeRO-3 保存后的完整权重导出、分片 checkpoint 续训与 Universal 转换是三件事。`elastic_checkpoint` 的旧 ZeRO-3 功能已弃用；不能凭名称推断可随意换拓扑。[Universal 教程](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/universal-checkpointing.md)说明受支持模型布局和 AutoTP/AutoEP 元数据的转换约束。
 
-当前 `Engine.load_checkpoint` 将 `load_from_fp32_weights` 配置标为弃用并忽略：完整ZeRO加载即使 `load_optimizer_states=False` 仍恢复保存的FP32 master，只重置optimizer状态；缺失分片直接报错。`load_module_only=True` 在ZeRO-1/2从模型重建master（Universal先从FP32读模型），ZeRO-3仍读FP32。NVMe关闭optimizer恢复时只拷FP32 swap文件，不再整目录复制旧moments。普通native checkpoint改变DP数仅允许 **elastic ZeRO-1/2的FP32权重且不载optimizer**，其余使用受支持Universal转换；详见[恢复专题](../topics/pipeline-schedule-and-checkpoint.md)。
+当前 `Engine.load_checkpoint` 将 `load_from_fp32_weights` 配置标为弃用并忽略：完整ZeRO加载即使 `load_optimizer_states=False` 仍恢复保存的FP32 master，但不载保存的optimizer状态；当前engine已有的moments和相关设置不会因此自动清空，fresh engine通常才是新建状态。缺失分片直接报错。`load_module_only=True` 在ZeRO-1/2从模型重建master（Universal先从FP32读模型），ZeRO-3仍读FP32。NVMe关闭optimizer恢复时只拷FP32 swap文件，不再整目录复制旧moments。普通native checkpoint改变DP数仅允许 **elastic ZeRO-1/2的FP32权重且不载optimizer**，其余使用受支持Universal转换；详见[恢复专题](../topics/pipeline-schedule-and-checkpoint.md)。
 
 观测也要使用同版定义：engine wall-clock snapshots/monitor及Pipeline吞吐现在调用 `elapsed_total`，而非旧 `elapsed`。记录timer scope和累计窗口再比历史日志；`deterministic_mode` 会在初始化调用determinism配置，不代表所有collective/kernel已经逐位可复现。
 
@@ -219,7 +273,7 @@ ZeRO-3 的 module hooks 进一步进入 coordinator：按当前模块获取参�
 
 [官方教程](https://www.deepspeed.ai/tutorials/) · [文档](https://deepspeed.readthedocs.io/en/latest/) · [Releases](https://github.com/deepspeedai/DeepSpeed/releases) · [开放/已合并 PR](https://github.com/deepspeedai/DeepSpeed/pulls)。固定源码完整目录见[source map](../../upstream/source-map/deepspeedai-deepspeed.md)，教程原文见[本地来源](../../upstream/docs/deepspeedai-deepspeed)。这些入口不表示所有历史特性均已精读，也未在本轮确认一份统一长期 roadmap。
 
-现有 [PR #8534：弃用 LoCo ZeRO++](../../upstream/prs/deepspeedai--DeepSpeed/PR-8534.md) 和 [PR #8632：offload 梯度存储/stream 修复](../../upstream/prs/deepspeedai--DeepSpeed/PR-8632.md)应与当前实现一起读。尚未收录的问题用 `wiki-search-pr "offload gradient storage" --engine deepspeed`，再取 PR 正文、review、最终 diff 与 `wiki-code` 固定源码。
+现有 [PR #8534：弃用 LoCo ZeRO++](../../upstream/prs/deepspeedai--DeepSpeed/PR-8534.md) 和 [PR #8632：offload 梯度存储/stream 修复](../../upstream/prs/deepspeedai--DeepSpeed/PR-8632.md)应与当前实现一起读。尚未收录的问题用 `wiki-search-pr "offload gradient storage" --engine deepspeed`，再按问题读取 PR 正文、相关 diff 与 `wiki-code` 固定源码，必要时才展开讨论。
 
 更新配置、coordinator、precision/backward 或 checkpoint 时，同时复核总览、两专题、相关案例及调用方（Swift/LlamaFactory 等）。分别登记源码合入、发布版本、HCU 适配和任务实测。本轮是固定源码/官方测试阅读，没有执行 HCU 分布式测试；结论不覆盖全部 op、所有混合并行或历史模型配方。
 

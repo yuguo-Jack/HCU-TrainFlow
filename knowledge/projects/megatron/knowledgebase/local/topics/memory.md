@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: docs/user-guide/features/dist_optimizer.md
@@ -65,10 +66,53 @@ sources:
   path: megatron/training/training.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: 1cfba3a404c97febc4c2e40895467372e6ab540006dc6a6e22fbc547087a5b75
+- source: nvidia-megatron-lm
+  path: megatron/core/pipeline_parallel/fine_grained_activation_offload.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: c485208fe6b6989b6cd89e0d0f2614a061f7b5816ad5f7dd8b31d73319b856b6
+- source: nvidia-megatron-lm
+  path: megatron/core/extensions/te_cuda_graphs.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 3f1b8d0a46a071bea2bec94a2017d25db0d8ad12da6d5fa92afa79c85029a036
+- source: nvidia-megatron-lm
+  path: megatron/core/distributed/distributed_data_parallel.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 03fcdd20914b67df6076717e85230fe4eee193e5052acf999151b273e6352fa8
+- source: nvidia-megatron-lm
+  path: megatron/core/distributed/param_and_grad_buffer.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 7c499c232cc76973892a04ea9e724fb296b763e28f852691f7bbe12440fa6c5d
+- source: nvidia-megatron-lm
+  path: megatron/training/training.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: c6fc98b09a21b609b2623eacbb224b8b9c168c840e922dca963ad4b0910e7237
+- source: nvidia-megatron-lm
+  path: megatron/training/config/training_config.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: f33a17f7f4ac2e53b5e72566a10782481ff5483550cccc0984f3c2dc6480923f
 retrieved_on: '2026-11-04'
 ---
 
 # Megatron 显存生命周期：状态分片、重算、offload与Paged Stash
+
+## 2026-11-18：reload 分配流、图同步与独立池所有权
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+细粒度 activation reload 现在先在当前消费者 stream 分配目标 GPU buffer，再让 H2D stream 等待消费者、复制 pinned 来源，最后由消费者等待 reload event。分配 stream 影响 allocator 可重用池：把分配留在 H2D 流会让释放后的块只能继续给 reload 使用。capture 外还等待该 group 的 offload event；capture 内有另一条既定依赖，不能为降低同步开销把两条都省掉。
+
+TE 图同步已从通用 FineGrainedActivationOffloadingInterface 拆到 `extensions/te_cuda_graphs.py::TECudaGraphOffloadingInterface`，后者按 manager 生命周期管理 stream/event，使用弱关联避免把替换后的 manager/张量永久保活，并通过 `defer_group_commits` 协调延后 D2H。旧 forward/backward_record 与 enter/exit_replay 调用不能原样继续从旧接口取。
+
+DDP 会在 wrapper 建立前 finalize；MXFP8 参数与 grad 共用 storage 的布局仍拒绝 grad-buffer offload。`needs_nccl_mem` 参数可另用对称池 backing param_data，grad 不因此一起放入该池，注册到哪些 group 与谁负责注销必须跟原 owner。新增可选 `eval_empty_cuda_cache` 在验证前后返还缓存给 driver，以缓解验证专家偏斜后 NCCL 外部分配失败，代价是训练缓存重建；它不是所有 OOM 的默认修复，也不等于活动张量已释放。
+
+### 本节固定证据
+
+- [megatron/core/pipeline_parallel/fine_grained_activation_offload.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/pipeline_parallel/fine_grained_activation_offload.py)
+- [megatron/core/extensions/te_cuda_graphs.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/extensions/te_cuda_graphs.py)
+- [megatron/core/distributed/distributed_data_parallel.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/distributed/distributed_data_parallel.py)
+- [megatron/core/distributed/param_and_grad_buffer.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/distributed/param_and_grad_buffer.py)
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/training.py)
+- [megatron/training/config/training_config.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/config/training_config.py)
 
 ## 先按 owner 和阶段分账
 

@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
@@ -62,6 +62,22 @@ sources:
   sha256: e29e6fdef3be07b400a22661fd07e0078870bad0b4e09cb3e4df5e373f37888f
   url: https://docs.nvidia.com/cudnn/fe-oss-apis/overview
   revision_kind: web-content-fingerprint
+- source: nvidia-cudnn-frontend
+  path: docs/utilities/python_graph_and_execution_backends.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 71ea0a2933a86945fdafe771e0c37b4f5fbb958722bce80b2868bed0d9e1707b
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 8dfe37611b359603153518bb88df3b58f51f387380211c444888296f11329961
+- source: nvidia-cudnn-frontend
+  path: pyproject.toml
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 7b370ace448b410cfd0f8246ecfd28af7d09b193f6598609503df5774f6e14df
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/support/README.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 548e12955a7a814f66501cd6c29396de323a73db12b7e9ec7cc950aad34b1381
 ---
 # cuDNN Frontend 官方教程、源码实例与更新索引
 
@@ -76,13 +92,15 @@ sources:
 | CPU overhead 与 cache | utilities 的 framework integration / dynamic cache / CUDA graphs | 分阶段计时、plan 生命周期、stream 和缓存失效。 |
 | 新稀疏 attention | BSA/NSA/DSA 文档与同目录 API/test | 稀疏元数据与训练支持；区分实验能力。 |
 
-官网使用 [当前 cuDNN 文档入口](https://docs.nvidia.com/cudnn/overview)，旧 deeplearning/cudnn/latest 入口已重定向到新站。本次8个登记节点分别保留新 canonical URL、HTML与文本哈希；这次迁移后的正文不能继续沿用旧站“未变”的判断。教程、固定源码与实际发布版本分别保存；主干新增的 Graph 包装或 FROST 能力须验证其是否进入所用版本。
+官网使用 [当前 cuDNN 文档入口](https://docs.nvidia.com/cudnn/overview)，旧 deeplearning/cudnn/latest 入口已重定向到新站。此前迁移后8个登记节点分别保留 canonical URL、HTML与文本哈希；2026-11-18 再次实际获取，正文指纹未变，保留该证据，不把本次 Git 主干变化写成官网也已同步。教程、固定源码与实际发布版本分别保存；主干新增的 Graph 包装或 FROST 能力须验证其是否进入所用版本。
+
+本次固定 `623ad8ff498a` 的重点是计划 recipe 失效、逐 plan 能力、attention mask/stats 合同和稀疏反向缓存；旧 FROST tracker 已声明历史状态，当前架构支持页成为后续查证入口。保留原有固定版本和适用的实现结论，未运行上游 GPU 单测或将新默认选择当作本地训练验证。
 
 ## 搜索和维护
 
 源码、教程 notebook 与接口文档登记在 `nvidia-cudnn-frontend`；官网正文登记在 `nvidia-cudnn-frontend-docs`。例如 `wiki-search "SDPA stats backward" --engine cudnn-frontend` 和 `wiki-search "grouped GEMM SwiGLU" --engine cudnn-frontend` 可定位对应专题，再读完整原文及固定代码。
 
-更新时分别运行这两个 source 的 `wiki-refresh`，检查 API/支持面、release、代码目录、教程参数及 PR review。新增 kernel 家族按价值补充，而非只把 README 列表拷进 Wiki。源码路径移动要更新注册表与章节引用；抓取失败或未完整阅读时保留 pending review，不误报所有知识已同步。
+日常分别对这两个 source 执行 `wiki-update`，检查登记范围的 API/支持面、release、代码目录与教程参数；发现文档迁移后按相关性补登记，深查时再显式 inventory/sync-docs/refresh。普通 PR 保留在线发现入口，形成结论时读必要正文、实现与讨论。新增 kernel 家族按价值补充，而非只把 README 列表拷进 Wiki。源码路径移动要更新注册表与章节引用；抓取失败或未完整阅读时保留 pending review，不误报所有知识已同步。
 
 Graph/plan 变化联动安装和性能案例；SDPA 变化同时复核 TE attention；融合/数值变化联动 HCU 承接边界与优化 Skill。依赖/许可变化核对当前 `LICENSING.md` 和具体文件声明。实际 HCU 运行仍需自己的源码、环境和验证证据。
 
@@ -109,3 +127,13 @@ Graph/plan 变化联动安装和性能案例；SDPA 变化同时复核 TE attent
 当前 Git 机制固定 `f88a1ef2a35bc405967691dd798eb062298fcd9a`，2026-11-04 重新核对官网8个节点。Quick Start 的 Graph context、framework integration 的分阶段计时继续成立，graph/cache 与 sparse API 的新增内容已按版本联动专题；官网 backend 默认 cache 与源码 Python compiled cache 分开解释。SDPA stride override、默认候选、后端累加类型以该 Git 版本节点/实现为准；官网旧 JAX 别名不替换当前导出。Flex 四项登记原件未变，保留其具体 mask/反向/生命周期合同；本轮无 NVIDIA/HCU 运行或完整 PR 续扫声明。
 
 2026-11-04 的 Releases API 最近10条同时包含多个 `v1.33.0.dev*` prerelease 和非预发布 [v1.32.1](https://github.com/NVIDIA/cudnn-frontend/releases/tag/v1.32.1)（2026-10-30）。这里仅记录该窗口观察，不能按列表首项或当前 CMake 的 1.33.0 推断最新 stable/部署包；发布兼容性仍按所用 tag、实际 backend 与依赖核对。
+
+## 2026-11-18 固定依据
+
+- [docs/utilities/python_graph_and_execution_backends.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/docs/utilities/python_graph_and_execution_backends.md)
+- [python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md)
+- [pyproject.toml](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/pyproject.toml)
+
+新增迁移支持文档的固定入口：
+
+- [python/cudnn/sdpa/frost/support/README.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/support/README.md)

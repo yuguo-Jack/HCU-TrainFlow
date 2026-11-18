@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: hiyouga-llama-factory
   path: README.md
@@ -89,13 +90,30 @@ sources:
   path: tests_v1/plugins/model_plugins/test_chunk_loss.py
   commit: 702005ce5237ae10f3c572c3f7741ecfd1422fc9
   sha256: ca9e673b2f6fc19c53bb76547e17fb24d6cc18d2f36167cee6fae55e8ef1a20e
+- source: hiyouga-llama-factory
+  path: README.md
+  commit: 885a4ca65cebf17a92e869af13c2ce42caca314a
+  sha256: 9d241cb43295691f504b5d01b8a7d2e11579b8841b90bd3aaf75ca8dbbb229d3
+- source: hiyouga-llama-factory
+  path: pyproject.toml
+  commit: 885a4ca65cebf17a92e869af13c2ce42caca314a
+  sha256: b095149dcfadd86c9a2a730ffb89974dfa447f2d560cc78367d0b3f79fc75d09
+- source: hiyouga-llama-factory
+  path: src/llamafactory/hparams/parser.py
+  commit: 885a4ca65cebf17a92e869af13c2ce42caca314a
+  sha256: 9828c236837588b70edbb041182d635dc6550a57b40ed01134bec965f2b9e920
+- source: hiyouga-llama-factory
+  path: src/llamafactory/model/model_utils/attention.py
+  commit: 885a4ca65cebf17a92e869af13c2ce42caca314a
+  sha256: 6a96aa82ee77d72f94882f28fae39293b2e9c17468638e36d9caee4e3665071f
+retrieved_on: '2026-11-18'
 ---
 
 # LlamaFactory：SFT 工程、两代训练入口与显存优化指南
 
 ## 定位与入口边界
 
-LlamaFactory 将模型/tokenizer、数据格式与对话模板、SFT/偏好训练、LoRA/量化和分布式 backend 组织为可配置工程。官方规范仓为 `hiyouga/LlamaFactory`，旧 `hiyouga/LLaMA-Factory` 是别名。当前固定提交 `702005ce5237ae10f3c572c3f7741ecfd1422fc9` 同时包含 legacy 与 v1，二者的数据对象、trainer、插件和配置字段不同。
+LlamaFactory 将模型/tokenizer、数据格式与对话模板、SFT/偏好训练、LoRA/量化和分布式 backend 组织为可配置工程。官方规范仓为 `hiyouga/LlamaFactory`，旧 `hiyouga/LLaMA-Factory` 是别名。2026-11-04 历史固定提交 `702005ce5237ae10f3c572c3f7741ecfd1422fc9` 同时包含 legacy 与 v1，二者的数据对象、trainer、插件和配置字段不同。
 
 `llamafactory.cli:main` 以 **`USE_V1`** 选择 launcher。默认 legacy 链的 `train` 按 stage 分派；v1 的 `sft/train` 进入新 `SFTTrainer`。因此一篇 v1 优化 PR 不能自动证明 legacy YAML 已具有同样功能。先记录实际入口和源码路径，再讨论兼容或性能。
 
@@ -123,7 +141,7 @@ LlamaFactory 将模型/tokenizer、数据格式与对话模板、SFT/偏好训�
 
 ## 安装与版本依赖
 
-当前 [pyproject.toml](https://github.com/hiyouga/LlamaFactory/blob/702005ce5237ae10f3c572c3f7741ecfd1422fc9/pyproject.toml)要求 Python≥3.11，核心约束包含 PyTorch≥2.4、Transformers 4.55.0–5.8.0 且排除 4.57.0/5.6.0，以及 Accelerate/PEFT/TRL 区间。README 的推荐版本表和个别新模型说明可能不同；实际安装优先核对目标 commit 的依赖配置、模型实现要求及已验证 HCU 配方，不能随意用 DISABLE_VERSION_CHECK 代替兼容验收。
+当前 [pyproject.toml](https://github.com/hiyouga/LlamaFactory/blob/702005ce5237ae10f3c572c3f7741ecfd1422fc9/pyproject.toml)要求 Python≥3.11，核心约束包含 PyTorch≥2.4、Transformers 的历史 4.55.0–5.8.0 区间（2026-11-18 新固定版本的上界及消费方条件见下节）且排除 4.57.0/5.6.0，以及 Accelerate/PEFT/TRL 区间。README 的推荐版本表和个别新模型说明可能不同；实际安装优先核对目标 commit 的依赖配置、模型实现要求及已验证 HCU 配方，不能随意用 DISABLE_VERSION_CHECK 代替兼容验收。
 
 源码安装入口为 `python -m pip install -e .`，可选能力按 [README](https://github.com/hiyouga/LlamaFactory/blob/702005ce5237ae10f3c572c3f7741ecfd1422fc9/README.md)的对应 requirements 安装。DeepSpeed、attention、量化和 fused kernel 是额外运行能力，导入包后仍需检查设备扩展与真实加载路径。训练场景不因安装了推理量化包就自动具有其训练后向支持。
 
@@ -180,3 +198,9 @@ v1 checkpoint coordinator 和 backend 保存 model/optimizer/trainer state；`sa
 官方入口：[教程](https://llamafactory.readthedocs.io/en/latest/)、[examples](https://github.com/hiyouga/LlamaFactory/blob/702005ce5237ae10f3c572c3f7741ecfd1422fc9/examples/README.md)、[Releases](https://github.com/hiyouga/LlamaFactory/releases)、[Issues/功能规划](https://github.com/hiyouga/LlamaFactory/issues)、[PR](https://github.com/hiyouga/LlamaFactory/pulls)。已收录 [PR #10762](../../upstream/prs/hiyouga--LlamaFactory/PR-10762.md) 涉及 v1 multimodal Ulysses 与 chunk loss，必须和当前最终实现及 tests_v1 一起读。
 
 检索 `wiki-search "Ulysses chunk loss" --engine llamafactory`；本地不足时线上 PR→固定源码。`wiki-update PROJECT hiyouga-llama-factory` 联动 legacy 与 v1、入口 switch、模型/数据/分布式插件、两个专题和相关测试。main、release、HCU 分支与任务已测分别登记；README 的支持表不能代替当前模型/backend 的实际验证。
+
+## 依赖与设备分支的当前准入
+
+固定 `885a4ca65cebf17a92e869af13c2ce42caca314a` 将 Transformers 的受检上界扩至 5.17.0，仍排除 4.57.0 和 5.6.0；legacy 推理 parser 接受 `vllm>=0.4.3,<0.29.0`。HCU vLLM 新插件的版本和这里的上界须分别核对，不能直接把官方新后端、HCU 插件与任意训练配方拼成兼容组合，也不以关闭版本检查代替回归。
+
+FA2 的 XPU 分支现在检查 Transformers `kernels` 集成是否可用，不满足时告警并返回；这是 XPU 专用条件，原 NPU/常规 FA2 分支另行处理，不是新增 HCU 支持。README 增加 Qwen3.8 模板条目只是发现入口，需要进一步核对真实模型配置/模板和有效 backend 后才能形成适配结论。当前 legacy packing 与 v1 CP/chunk-loss 的历史证据分别保留。

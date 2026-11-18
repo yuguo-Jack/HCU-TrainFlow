@@ -10,8 +10,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: fixed source delta and actual consumer review; historical pins retained; no HCU runtime validation
 sources:
 - source: nvidia-nemo-megatron-bridge
   path: README.md
@@ -69,7 +69,31 @@ sources:
   path: src/megatron/bridge/models/hf_pretrained/state.py
   commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 0729aa811936cc1f6caa02cbe54f3d9d74cd6173464bb03555a6341d54a0c849
-retrieved_on: '2026-11-04'
+- source: nvidia-nemo-megatron-bridge
+  path: README.md
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: 422ef3137765d4bd7b2a478bae109baa33c50eb37255673ef710a689834b14f2
+- source: nvidia-nemo-megatron-bridge
+  path: pyproject.toml
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: cb14b27dd667adaf27777c27a5f472338d4ae33a31c5a44afa048cb1b750a99a
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/training/config.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: fca097a18062d74b23785fe30782d507df32bb1e89816112e377cb70b284a261
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/models/gpt_provider.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: da3c92f65431864e3079e09167dbcdb96e911731e0bff73d82795894977fd625
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/training/train.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: a438b252612cbe51cced1193f917333dc08cdae445f3c9497517d34ca7781638
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/training/pretrain.py
+  commit: 11d8b349d2daff3523bb9655b04f4ad33a9e9ea9
+  sha256: 6534422c772f10bb8927f3c13e981d40a7758c1d63b458cc5b8372cfa1190c3c
+retrieved_on: '2026-11-18'
 ---
 
 # Megatron Bridge：配方、Provider、通信与完整训练状态
@@ -97,7 +121,7 @@ HCU独立Bridge patch仓、HCU Megatron-LM内嵌Bridge和本页官方main是不�
 
 ## 3. 安装、版本与真实加载
 
-本页当前核对官方 main `41af2dcf0dfd83c8933f588bb871b7f56dbd4368`，父树的 `3rdparty/Megatron-LM` 固定为 `e0a4bfed7f1e233b857187ceff0104645858d7d1`。2026-11-04 检索的 `pyproject.toml` 仍要求 Python>=3.12,<3.13，Transformers 上界仍为 <5.21；本轮 FlashInfer Python/cubin 同步推进到 0.7.2.post1、ModelOpt 为 0.48.0、cuDNN Frontend 为 1.32.0，另有 filelock/GitPython/cryptography 约束更新。依赖注释或最低版本不代替实际可安装、扩展加载与硬件验证，不能只更新 Bridge Python 文件而忽略实际 Core/扩展组合。build依赖Torch/pybind11，一些TE/SSM扩展有单独build isolation要求。应按该提交安装文档/锁文件与实际运行镜像配套，不将包classifiers或单个pip成功当兼容证据。
+本页当前固定官方 `11d8b349d2daff3523bb9655b04f4ad33a9e9ea9`；实际父树 `3rdparty/Megatron-LM` 为 `a463e854a7aba6e93aa03cb0a7cdd49ee4612cb6`，与独立 Core 专题的 `91260b59` 不同。`pyproject.toml` 要求 Python>=3.12,<3.13，Transformers 改为 >=5.21.1,<5.24，明确跳过会破坏 Step-3.5 config 的 5.21.0；uv 约束另限制 pyarrow<26、httpx<1，并为所选 Core 镜像 CUDA13/架构相关 FlashInfer JIT-cache 元数据。包依赖、uv resolver 覆盖、发布容器和现场 HCU 镜像分别核对，不能把这张 NV wheel 清单直接装进 HCU 环境。build isolation、Torch/扩展 ABI 与实际 import 路径仍需按所用提交验证。
 
 release software-versions表列NeMo容器的Core/TE/Torch/Bridge组合，是发布配对，不自动代表main与HCU部署相同。本页提供查找机制；真实任务保存Bridge/Core/TE/attention/Energon及patch版本、import路径、库制品和有效配置。不能为读Wiki把最新NV依赖装进HCU训练镜像。
 
@@ -137,19 +161,30 @@ recipe→ConfigContainer validate/finalize/runtime update→GlobalState→provid
 
 全新实验把`checkpoint.load=None`、save独立目录，避免common recipe默认目录误续跑。保存阻塞单独计时、验证async完成标记和数据位置，恢复后持续观测loss、step、显存及旧进程残留。NVRX与HCU站点容错的能力/依赖不同，唯一恢复owner由任务确定。
 
+README 新列 Inkling 2 Small 和 ERNIE-5.5 的官方模型入口。前者宣传的转换、图文推理和 GB200 配方，后者列出的 SFT 入口均需继续核对对应 verification card、模型结构和配方依赖；这里没有采纳为 HCU 已支持，也不由模型列表推广全部训练组合。
+
 ## 9. PR、发布和更新入口
 
 [官方文档](https://docs.nvidia.com/nemo/megatron-bridge/latest/)、[Releases](https://github.com/NVIDIA-NeMo/Megatron-Bridge/releases)、[PR](https://github.com/NVIDIA-NeMo/Megatron-Bridge/pulls)、[固定源码导航](../../upstream/source-map/nvidia-nemo-megatron-bridge.md)和[原文](../../upstream/docs/nvidia-nemo-megatron-bridge)各有职责。`wiki-search-pr "问题/机制" --engine bridge`可找未写案例的PR，再读取讨论、head/base、实现和测试；open、merged、released、HCU采用和任务实测分别确认。
 
-[#6140](../../upstream/prs/NVIDIA-NeMo--Megatron-Bridge/PR-6140.md)说明替换decoder后还需finalize TE precision；[#6406](../../upstream/prs/NVIDIA-NeMo--Megatron-Bridge/PR-6406.md)解释decentralized provider中MTP最终builder的rank传递问题。本次固定 `gpt_provider.py` 尚未包含该最终调用的参数变更；保留讨论中的 CPU 回归范围，不由 PR 状态或后续 Core HEAD 推定本快照已修。
+[#6140](../../upstream/prs/NVIDIA-NeMo--Megatron-Bridge/PR-6140.md)保留 decoder replacement 后 precision 初始化的历史定位。对 [#6406](../../upstream/prs/NVIDIA-NeMo--Megatron-Bridge/PR-6406.md)，当前 `mtp_block_spec` 已接收显式 `pp_rank`，并传到 callable spec 和最终 Core builder；旧“最终调用尚未传 rank”的结论只适用于 `41af2dcf`。无全局 MPU 的调用者仍须传真实所属 PP rank，不能由接口新增推定所有调用点、GPU 或 HCU 已通过，详见 Provider 专题。
 
 相对上轮 `2b1c8ccd7285cfd09b82afd523859dbe04d754e4`，本轮训练侧变化包括 emerging optimizer 的 LayerWise 分布规范化、MFSDP V2 checkpoint / dtype 校验边界、退出时 DataLoader 和 local graph runner 的释放，以及 collective adapter 导出只在 rank0 保留完整权重并广播写入错误。Qwen3 MoE 的 H100 recipe 改走 builder-backed `get_model_config()`，ModelOpt 导出改用 prepared plan 与 grouped stream；这些入口不能和旧 provider/导出 API 混用。README 新增 MiniCPM-o 4.5 的 text/image/audio understanding，明确不含 speech generation 或 SFT/LoRA recipes；不由模型列表推导全部训练组合可用。DPO 数据/loss、确定性委托和旧权重清理机制来自此前版本，其未变消费者继续保留。
 
 更新核对实际Core/TE/Energon版本和HCU父gitlink，同时复核总览、三专题、模型recipe和依赖调用。PR讨论变化可能修正结论，即使文件哈希未变也检查；roadmap若在Issue/Discussion/Project继续在线查，不把采集PR窗口称作全部历史覆盖。
 
-本轮保留依据：`gpt_provider.py`、DPO builder/数据/step/loss 与所引测试、`StateSource`、发布配对表和主要训练指南字节未变，故保留 MTP 最终调用仍缺该 PR 参数变化、DPO pair/token 口径及 HF 旧权重清理边界。新的 NVRx 文档指出 inprocess API 已弃用且在较新 main 移除，必须检查实际安装版，见恢复专题。主仓冻结、底层 Core gitlink与HCU部署是三项不同证据。
+2026-11-18 复核还改变了配置与退出方法：Megatron-FSDP 选择转到 `cfg.ddp.use_megatron_fsdp`，显式梯度 dtype 和最终 Core finalize 决定真实精度；异常退出先清理 optimizer 持有的 graph 引用而不等待可能失败的 CUDA collective。HF 转换补了平面 RoPE config 搬运、精确 key 排除和有限的 ModelOpt 映射支持，分别见三项专题。DPO builder/数据/评分/step/loss、主要训练指南和版本配对表字节未变，保留其原数值与数据位置约束；NVRx 文档这次仅增旧版 inprocess guide 链接，未改变既有弃用/恢复 owner 判定。主仓内容、Core gitlink和现场部署仍是三项独立证据。
 
 2026-11-04 固定 GitHub 最近10条 release 观测已包含 [`v0.7.0`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/releases/tag/v0.7.0)（2026-10-30）。该发行记录不把本页 main 的 LayerWise/FSDP/ModelOpt 等所有变化自动纳入0.7.0；release 配对表、tag 原件、main 与 HCU 使用锁分别确认。
+
+## 2026-11-18 固定消费者
+
+- [README.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/README.md)
+- [pyproject.toml](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/pyproject.toml)
+- [src/megatron/bridge/training/config.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/training/config.py)
+- [src/megatron/bridge/models/gpt_provider.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/models/gpt_provider.py)
+- [src/megatron/bridge/training/train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/training/train.py)
+- [src/megatron/bridge/training/pretrain.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/11d8b349d2daff3523bb9655b04f4ad33a9e9ea9/src/megatron/bridge/training/pretrain.py)
 
 ## 固定证据与复核范围
 

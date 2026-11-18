@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
@@ -68,7 +68,32 @@ sources:
   sha256: 983e93a50785e09d921be543498398149788383692039e0076b9392f6a106dca
   url: https://docs.nvidia.com/deeplearning/transformer-engine/examples/attention/attention.html
   revision_kind: web-content-fingerprint
+- source: nvidia-transformerengine
+  path: docs/installation.rst
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 86372814c4a1f14ef7be6bbbfd20c707ccd63a0e0bd707cce645b4bf4263fa0e
+- source: nvidia-transformerengine
+  path: docs/envvars.rst
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: cc8514ad8c952a78b6a116b4f470dfeb34c035204f98e0d9cce3f9df6b4a8857
+- source: nvidia-transformerengine-docs
+  path: advanced-optimizations
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: c977c8d5cc732d9bb29b43914503a926f139746296f0d390a7b185b128ffe16c
+- source: nvidia-transformerengine-docs
+  path: attention
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: 601ea62774d0b15f9a0a51cf7af707d63527fdbeec7c8fec98a2a419164c5e25
+- source: nvidia-transformerengine-docs
+  path: fp8-primer
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: b249549e2d4c96315a038cf6f869ece7863cacf9993b79aa9ff00c96a9662c8b
+- source: nvidia-transformerengine-docs
+  path: getting-started
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: a1004c72da2e072bc652a7e061d7f5bb57b44ecc0cc7d4d4a6f54e76c8b5d0b4
 ---
+
 # TE 官方教程索引与版本更新方法
 
 ## 按问题选择教程
@@ -82,21 +107,23 @@ sources:
 | 想按 NV 粒度融合 | `docs/examples/op_fuser/op_fuser.rst` | 操作序列、fwd/bwd 不同融合、saved tensors 与返回值契约。 |
 | 模型内 GEMM 是否太慢 | `docs/examples/gemm_profiling/gemm_profiling.rst` | 本 rank shape、fprop/dgrad/wgrad、预量化与 autocast 计时边界。 |
 
-官网入口为 [TE 文档](https://docs.nvidia.com/deeplearning/transformer-engine/index.html)。本次核对官网展示 2.20.2；登记的 main 提交可能包含尚未发布的功能。引用时优先任务安装版本相应文档，不把滚动官网、主干和 HCU fork 混合成一个已验证环境。
+官网入口为 [TE 文档](https://docs.nvidia.com/deeplearning/transformer-engine/index.html)。本次八个登记官网节点均展示 2.21.0，使用独立网页内容指纹 `72dfe3c0…`；GitHub 最新非预发布为 [v2.21.0](https://github.com/NVIDIA/TransformerEngine/releases/tag/v2.21.0)，发布于2026-11-10。登记的 main 提交仍可能包含该发布之外的功能。引用时优先任务安装版本相应文档，不把滚动官网、主干和 HCU fork 混合成一个已验证环境。
 
 2026-11-04 官方 Releases API 最近10条快照中，最新一项为非预发布 [v2.20.2](https://github.com/NVIDIA/TransformerEngine/releases/tag/v2.20.2)，发布于 2026-10-05；该快照不宣称完整发布历史。它与本次 main 固定提交分别记录，不把 develop/main 新增的融合或缓存机制自动当作该 wheel 已提供的行为。
 
 ## 搜索与更新
 
-`wiki-search "FP8 权重缓存 microbatch" --engine transformer-engine` 可命中本库主题；沿页尾固定链接查看详细教程和实现。源码教程（包含 notebook）登记在 `nvidia-transformerengine`，官网 HTML 页面独立登记为 `nvidia-transformerengine-docs`，两者都用 `wiki-refresh` 更新；详情见项目 [更新协议](../../../../../../docs/wiki.md)。
+`wiki-search "FP8 权重缓存 microbatch" --engine transformer-engine` 可命中本库主题；沿页尾固定链接查看详细教程和实现。源码教程（包含 notebook）登记在 `nvidia-transformerengine`，官网 HTML 页面独立登记为 `nvidia-transformerengine-docs`，日常用 `wiki-update` 检查登记范围；只有需要扩展相关文档或深查时才显式 inventory/sync-docs/refresh，详情见项目 [更新协议](../../../../../../docs/wiki.md)。
 
-更新时检查 release notes、目录/toctree、新增教程与关键测试，不仅比较旧路径。新增关注主题先加入 registry；阅读相关 PR 的正文、评论、顶层 review 及最终代码。量化变化影响 precision/cache、graph、数值基线；attention 变化影响 TE 及 cuDNN 页面；overlap 变化影响训练分析与操作指南。全部相关正文/Skill 复核后才登记已审核版本。
+按变化影响检查 release notes、目录/toctree、新增教程与关键测试；新增关注主题经筛选再登记。普通 PR 联搜发现，形成结论时读取正文、固定实现和必要讨论，不默认补采全部评论或逐仓扩写。量化变化影响 precision/cache、graph、数值基线；attention 变化影响 TE 及 cuDNN 页面；overlap 变化影响训练分析与操作指南。全部相关正文/Skill 复核后才登记已审核版本。
 
 网页采集的 `commit` 字段为兼容回执结构使用内容指纹，并标记 `web-content-fingerprint`；它不是 Git SHA。原始 HTML 和可读文本留在私有工作区。作者说明、URL、哈希和来源锁提交；抓取完成不等于教程已逐条运行。
 
+本次源码 `8e89d3ad8b2c` 的变化集中于安装下限、CuTeDSL 分发诊断、FA4 导入条件、Norm 输出 scale 组织、Grouped MLP 与 Graph/recipe 状态。按这些消费者修订现有页，不把滚动官网、源码主干、已发布 wheel 和 HCU fork 合并成一个版本，也没有执行上游设备测试。
+
 ## 来源与版本复核
 
-2026-11-04 复核源码为 `720b25258be3b60f482afff8aef00d4cad88fa16`；docs/index 新增 MoE 专题入口，源码教程主体、安装示例与 RMSNorm-MXFP8 直接实现/测试继续复用已固定机制。官网8个节点仍展示2.20.2，本次正文原件已重新核对：安装的 CUDA/cuDNN 与 ABI 约束、权重缓存的 microbatch 合同、attention 支持表和 op-fuser channel 边界分开解释；不能由网页版本号或内容指纹推导 main 的 BF16 融合已发布到 wheel。低精度 helper 的局部测试、后端选择、完整训练质量仍是不同证据，本轮未执行 NVIDIA/HCU 示例或补称 PR 续扫已经完成。
+2026-11-04 复核源码为 `720b25258be3b60f482afff8aef00d4cad88fa16`；docs/index 新增 MoE 专题入口，当时的源码教程主体、安装示例与 RMSNorm-MXFP8 直接实现/测试复用已固定机制。该次官网8个节点仍展示2.20.2；当时核对范围为：安装的 CUDA/cuDNN 与 ABI 约束、权重缓存的 microbatch 合同、attention 支持表和 op-fuser channel 边界分开解释；不能由网页版本号或内容指纹推导 main 的 BF16 融合已发布到 wheel。低精度 helper 的局部测试、后端选择、完整训练质量仍是不同证据，本轮未执行 NVIDIA/HCU 示例或补称 PR 续扫已经完成。
 
 - [nvidia-transformerengine: docs/index.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/index.rst)
 - [nvidia-transformerengine: docs/getting_started/getting_started_pytorch.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/getting_started/getting_started_pytorch.py)

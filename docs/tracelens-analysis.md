@@ -4,6 +4,8 @@
 
 当前集成核对基点是 HCU fork `22786b16d429783927981bd592a47ad0f79db3ba`，上游基准 `493f7508505f36e6ac850aaa29a252bef51e23fc`。HCU-Knowledge 的工具资料不替代这个 fork 的 API；本页与 TrainFlow worker、固定 `training_graph`、`hcu_roofline`、`hcu_analysis`、hipprof/XCompute reader 和 split/merge/compare 源码一起核对。文档更新不自动推进锁、安装依赖或扩大下述历史硬件验证范围。
 
+官方 Wiki 的来源版本与这个运行锁分别维护。官方 `7bef4432661a9a5094b54828ce462ea375ede85c` 的[PyTorch report](https://github.com/AMD-AGI/TraceLens/blob/7bef4432661a9a5094b54828ce462ea375ede85c/TraceLens/Reporting/generate_perf_report_pytorch.py)新增默认关闭的 idle 分析和 augmented trace；现用 fork 与受管请求没有这些新参数。查阅上游能力时先判断实际依赖是否具备对应接口，按[官方分析机制](../knowledge/projects/tracelens/knowledgebase/local/overview/engineering-guide.md)保留来源版本，不将上游新开关直接传给当前 worker。
+
 ## 选择入口
 
 按当前问题选用表中路径，不将全功能资格测试作为每个模型的必做清单。相同 trace/窗口/工具身份的有效报告直接复用；调用归属不清才补 Graph，模型与独立性能有疑问才回放，需要解释硬件瓶颈才采相应计数器。已有充分分析时无需再启动原生 Agent 重复一遍。原生 Agent 的适用推理/复核可纳入同一候选审查并引用其回执，避免多轮相同内容的独立审核；各自的证据契约仍需通过。
@@ -72,6 +74,8 @@ hcu-trainflow --workspace /private/task/analysis tracelens-analyze request.json 
 比较和高级报告也要查原生日志与 warning。非空 op/kernel 聚合表不保证逐调用细表完整；遇到 kernel-list 长度不一致、未关联调用或跳样，保留受影响范围并回查原 trace，不能用自比较成功证明当前模型映射完整。worker 会把原生 warning 保留在日志和回执中；已知逐调用跳样使 compare/Graph 的 `generated` 降为 `incomplete`，Agent 仍为 `needs-agent-review` 并注明原生报告不完整，普通提示不自动改判失败。比较请求的形状、phase、精度、rank 和窗口仍由调用方匹配，工具不自动建立训练配方等价。
 
 每次生成独立目录，保留请求、输入/输出 SHA256、锁定源码提交、原生表、日志和 `report.json`。`generated` 仅表示该范围产物完成；`incomplete` 保留未知项；`needs-agent-review` 表示指标已准备、推理复核尚未完成，后两者返回退出码 2。残留 CSV 不能将失败/超时改判成功。这些状态都不替代训练阶段的数值、性能或独立 review 门槛。
+
+输入绑定包含 compare 的两份 trace、merge 的每个实际 rank 文件，以及 Graph manifest 引用的 replay/capture 文件；counter manifest 引用的本地文件也进入回执。运行期间输入改变或消失会判失败，不能将旧输出重新解释为新输入的结果。Graph 的显式 capture 契约与原生推理 capture-merge 的启发式恢复分别使用，不能因上游能选出 annotation 或最近 capture 就放宽训练 Graph 的检查。
 
 ## Roofline 与优化队列
 

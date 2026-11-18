@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
@@ -80,8 +80,39 @@ sources:
   path: test/python/core/graph/test_graph_native.py
   commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 7ebdaceb2f26927deb00d4eeac923fbab89167f5d301f45fc7a98ff2e3feae17
+- source: nvidia-cudnn-frontend
+  path: docs/utilities/python_graph_and_execution_backends.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 71ea0a2933a86945fdafe771e0c37b4f5fbb958722bce80b2868bed0d9e1707b
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/_pygraph.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: bf17e14d6250b2c85107308d4ee885877ce10fb2d458389754f2af5204d99126
+- source: nvidia-cudnn-frontend
+  path: include/cudnn_frontend/graph_interface.h
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: d18753aa1de5f83a2dbf18e6c108afef19ccb492979ec1c7226f5278c79efe8c
+- source: nvidia-cudnn-frontend
+  path: docs/operations/Normalizations.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 6b88e16de6690b7fb1d2556715bb70dbeeaa583d669d741eb99601d52667444c
+- source: nvidia-cudnn-frontend
+  path: test/python/sdpa/frost/test_flashinfer_consumed_surface.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 990f35f7f2210a9c44f13ba7a024490b8410bd3d80fdb44bf4ca6349c292130c
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/support/README.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 548e12955a7a814f66501cd6c29396de323a73db12b7e9ec7cc950aad34b1381
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/support/sm100.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: cb932367bf5dcb75b4d2f56dcd7c274438851e6fe7f3d99f8e8da907ad470c51
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/sdpa/frost/support/sm120.md
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 054e7604b8274fd9c1b4d90bbf865ca15eef456b55413d0d368201717169c7a2
 ---
-
 # cuDNN Graph、执行计划、Workspace 与动态形状缓存
 
 ## 构建阶段与执行阶段
@@ -109,6 +140,16 @@ heuristic A/B 提供候选，fallback 注重可运行性；候选还需 check_su
 当前 Python engine 的 serialize 保存图 IR、engine 身份/knobs，以及可选编译缓存原件；不能精确表示的 callback/框架对象会被拒绝，build 时绑定的实际 tensor 不随 blob 保存。deserialize 只在编译环境 manifest 完全一致时 seed kernel，否则重新编译，`enforce_precompiled=True` 则拒绝回编译；C++ Graph 不读取这种 `CUDNN_FE_PYPLAN` 格式。新缓存冷启动去重依赖 POSIX advisory lock，不支持锁时继续编译；使用中的 `.locks` inode 不应删除。
 
 官网的 backend 默认 kernel cache 另按设备维护并使用 LRU，与上述 Python 编译制品缓存不是同一层；传入 custom cache 时，容量/生命周期策略也不同。缓存命中不能替代输出地址、长度及 stream 生命周期校验。
+
+## Recipe 资格、能力声明与反序列化
+
+固定 `623ad8ff498a` 明确区分 recipe 与编译二进制缓存：持久化 recipe 要按 Frontend build/version 及目标环境隔离。旧 engine id 即使保留，也不保证当前版本仍接收旧 graph/config；SM90、SM100/SM103、SM107 和 SM120 的部分实现已拆分显式 owner。退役 recipe 应作为 cache miss 丢弃并从 heuristics 重建完整 engine/knob 组合，不能仅改 id 或把 `frontend_version` 当自动 fallback 开关。Python deserialize 遇到不再准入的 recipe 会报错并恢复空目标，而不是静默替换实现。
+
+运行时布局资格来自最终选定 plan 的 `get_behavior_notes()` / `get_behavior_notes_for_plan_at_index(i)`。新 `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` 只承诺对应 override-enabled half THD、packed HN Stats 与 prepared binder 的已准入组合，不允许改 packing、dtype、容量或绕过 ragged/override 边界；SM121 仍未获该资格。没有此 note 就继续既有 NH 路线，不能从名字含 FROST 或架构号猜能力，也不为选 Stats 布局先过滤掉整个候选池。使用这个新 enum 的消费者还须明确所用 FE 版本提供该字段。
+
+Python execute 对可观察的连续 workspace 容量检查本次 shape/plan 的需求，并按 Handle 的真实 device/stream 进入执行上下文；裸整数地址容量未知仍由调用方保证。C++ plan 反序列化新增先解析/校验元数据、replacement 链与 owned spans 后发布执行状态的保护，畸形 payload 返回错误。它不替代调用方对可信固定原件、缓冲所有权和跨版本资格的核验。
+
+新 `custom_reduction` 接收多路输入、identity 和构图 callback，要求 cuDNN≥9.29 的头文件及 runtime。`reducer_semantic_key` 进入 graph key，callback 行为变更必须同步变 key；callback 返回后不能再编辑 child graph。该 callback 无法从结构 JSON 重建，因此结构只供检查，不能误当可回放 artifact；需要匹配执行 plan 的序列化路线。
 
 ## 故障定位顺序
 
@@ -150,9 +191,25 @@ FlashInfer 消费的 `selected_engine`、`backend_plan_entries()` 与 native bin
 - [python/pygraph/norm.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/pygraph/norm.cpp)
 - [test/python/norm/graph/test_layernorm.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/test/python/norm/graph/test_layernorm.py)
 
+Norm 文档现在明确区分 BatchNorm inference 与融合训练图：该节点不计算或更新统计量；单独 BN inference 或后接 forward ReLU 并不由所列 backend 支持。`peer_stats` 对应同步 BN 的额外统计输入。Adaptive InstanceNorm 的 scale/bias 是每样本每通道且空间维为1，输入须 channels-first contiguous，并限 Python engines；不能把普通 Norm 的 backend 准入直接扩大到 adaptive 模式。
+
 ## 本次补充的实现与测试依据
 
 - [nvidia-cudnn-frontend: docs/developer/overview.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/developer/overview.mdx)
 - [nvidia-cudnn-frontend: python/cudnn/__init__.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/__init__.py)
 - [nvidia-cudnn-frontend: test/python/sdpa/frost/test_flashinfer_consumed_surface.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/test/python/sdpa/frost/test_flashinfer_consumed_surface.py)
 - [nvidia-cudnn-frontend: test/python/core/graph/test_graph_native.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/test/python/core/graph/test_graph_native.py)
+
+## 2026-11-18 固定依据
+
+- [docs/utilities/python_graph_and_execution_backends.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/docs/utilities/python_graph_and_execution_backends.md)
+- [python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/_pygraph.py)
+- [include/cudnn_frontend/graph_interface.h](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/include/cudnn_frontend/graph_interface.h)
+- [docs/operations/Normalizations.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/docs/operations/Normalizations.md)
+- [test/python/sdpa/frost/test_flashinfer_consumed_surface.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/test/python/sdpa/frost/test_flashinfer_consumed_surface.py)
+
+新增迁移支持文档的固定入口：
+
+- [python/cudnn/sdpa/frost/support/README.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/support/README.md)
+- [python/cudnn/sdpa/frost/support/sm100.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/support/sm100.md)
+- [python/cudnn/sdpa/frost/support/sm120.md](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/sdpa/frost/support/sm120.md)

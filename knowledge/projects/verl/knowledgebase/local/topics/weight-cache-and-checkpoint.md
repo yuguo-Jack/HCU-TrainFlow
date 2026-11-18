@@ -10,8 +10,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: fixed source delta and current V1/backend/restore consumers; historical evidence retained; no HCU runtime validation
 sources:
 - source: volcengine-verl
   path: verl/workers/engine_workers.py
@@ -81,6 +81,59 @@ sources:
   path: tests/utils/real_nvfp4/test_training_guards_on_cpu.py
   commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: 3154018aec563be362d2a79b8ad76af13fd38e39cdc345bde36e9149eab0f160
+- source: volcengine-verl
+  path: README.md
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: 11bb568ff2644ddb595580eb18d61df10ecb2d3f9b453ad396dcf59da108d7ab
+- source: volcengine-verl
+  path: verl/trainer/main_ppo.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: b5fa23c8722376520e13784cb211ac14d285dedc3b802ebfb85b6489457966df
+- source: volcengine-verl
+  path: verl/trainer/ppo/v1/__init__.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: 82af7aa18d3d90a46a0f87605d4f7105e0b17659a48380b3e50fb5d878be6032
+- source: volcengine-verl
+  path: verl/trainer/ppo/v1/trainer_base.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: f96ea47392927d1f870b0f382492addafa6d359b8e4ecb9c8395384da8c9e74d
+- source: volcengine-verl
+  path: verl/trainer/ppo/v1/trainer_sync.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: bc805f2990910f29e11b45c43a0687eae645cee375ab6b9a7211650022f00186
+- source: volcengine-verl
+  path: verl/workers/engine_workers.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: eb9d1e40aee0443f85f23b499ee9d34cff15cf39f2d28271b5948fd0952e6175
+- source: volcengine-verl
+  path: verl/workers/engine/megatron/transformer_impl.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: f788e47138b7703c443a38ee935f77a4636a03ead24057f08b6d3fb19eacdfe5
+- source: volcengine-verl
+  path: verl/workers/rollout/sglang_rollout/sglang_rollout.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: b6facb4d512ce63067014fbb0436eed7398228cd1c4673dbbe4b7e2c4e3612a1
+- source: volcengine-verl
+  path: verl/workers/rollout/sglang_rollout/http_server_engine.py
+  commit: b0871fd89d19329d8c9ed58e5402b11dcf920b64
+  sha256: 8407275b86ed89ae8f7068d2e8f407152e62cbd3d633b06b44b1364895ec9703
+- source: sgl-project-sglang
+  path: docs/docs/advanced_features/sglang_for_rl.mdx
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 913fc4f4726b9ff0160fe66e2d3bd06fca561c780ddc378c0b29d80fac16c05a
+- source: sgl-project-sglang
+  path: python/sglang/srt/entrypoints/http_server.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 4f12b6f21438c4493a122fc940c14ba275f11e9778bf211731c6a623327e88b9
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 523c96a107548ce1b3871b5fe8191faa797085225030acbb9e3839ff4cac4fcd
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth_levels.json
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: ecb5585cdf47c833231e44daf0355ef20ea7ab2583d171f95569359a99623ce1
+retrieved_on: '2026-11-18'
 ---
 
 # verl：权重发布、LoRA、KV 显存与持久化恢复
@@ -134,11 +187,21 @@ SGLang的all-MXFP8配置会翻译为native格式并改scale命名；MXFP4/MXFP8 
 
 固定CPU测试覆盖NVFP4 per-token scheme、carve-out、缺半对和runtime guard；`test_nvfp4_per_token_refit_on_gpu.py` 是量化对照入口。本页只阅读设计，未运行GPU、HCU或全模型回归。
 
+### SGLang 控制面凭据与版本边界
+
+SGLang 当前固定 `78b8523` 把 pause/continue、memory release/resume、weight update/group/version 等列为独立 admin endpoints：需服务配置 admin key，控制请求携相应 Bearer；普通 api-key 不解锁；auth_levels.json 的 admin_force 在未配置 admin key 时返回403，已配置但缺失/错误 Bearer 返回401，health 成功不验证该权限。这个访问契约只代表该固定官方版本，不是现场 HCU 服务已升级；参见[固定 RL 控制文档](https://github.com/sgl-project/sglang/blob/78b8523f77ea6b930d065c9dd128a97b222a35c9/docs/docs/advanced_features/sglang_for_rl.mdx)。
+
+已读 verl `b0871fd8` 的 SGLangRollout→AsyncHttpServerAdapter：resume/release/refit 通过 `_make_async_request`，其 `_get_session` 和 POST/GET 不设置 Authorization；rollout 构造也不传 admin 参数。启动时 health/flush 检查使用普通 server_args.api_key，并不为异步控制请求补授权。因此对接上述新 SGLang 版本存在 admin 凭据接线缺口，不能将普通 API key 或健康检查成功当控制面成功。实际部署保留其已验证依赖，升级先核对服务版本、路由、响应体和独立控制凭据，再验业务结果与真实权重；403 是权限结果，timeout/断连又不能证明更新未执行，不得盲重放后宣称原子发布。
+
 ## 持久化 save/load 与数据进度
 
-[`RayPPOTrainer._save_checkpoint`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/trainer/ppo/ray_trainer.py)保存`global_step_N/actor`、可选critic和`data.pt`（statefuldataloader）；同步路径再写latesttracker。async_save时driver明确跳过写`latest_checkpointed_iteration.txt`，需确认实际backend的完成/恢复选择协议，目录出现不证明可用。
+当前 `b0871fd8` 主线已删除旧 RayPPOTrainer。实际 V1 `PPOTrainer._save_checkpoint` 保存 global_step_N 下 actor、可选 critic、data.pt；异步 trainer 模式另保存 TransferQueue state/global_steps。同步 actor checkpoint 分支才写 latest_checkpointed_iteration.txt，async_save 分支跳过 tracker 并通知 checkpoint_callback，仍须核对 backend 的真实完成/持久化协议。不能把目录出现、callback 返回或传权完成当作全部训练状态可恢复。
 
-`_load_checkpoint`支持disable/auto/resume_path，目前HDFS恢复明确未实现。恢复actor/critic后处理data.pt；若globalstep恰在epoch边界，刻意不恢复耗尽的dataloader，让新epoch重新迭代；缺data.pt则警告从头读数据。model加载、optimizer恢复和数据准确接续分别验证。
+V1 `_load_checkpoint` 以 disable/auto/resume_path 选择本地恢复根，加载 actor/critic 后直接恢复 data.pt；旧 V0 在 epoch 边界刻意跳过耗尽 loader 的描述不再是当前分支。自定义 dataloader 必须有 load_state_dict 且状态为 dict，缺 data.pt 直接报错；内建 loader 缺状态只告警从头读取。自定义 reader 无 state_dict 仍可保存模型，但明确不支持完整训练 resume，不能给它补一个空 data.pt 伪装精确接续。
+
+异步模式的 TransferQueue 保存已取走但尚未训练的 prompts/trajectory。恢复会保留已完成结果，对 pending/running prompt 清掉旧 trajectory、改回 pending 并在 fit 取得 AgentLoopManager 后重发，属于新的 dispatch attempt，不能承诺原生成 exactly-once 或相同随机输出。版本、UID/session、行为 logp、数据游标和实际参数仍需共同验收；该策略与 AReaL 新 backend lease 的“不确定执行禁止自动重放”是不同实现，不能相互套用。
+
+V1 sync 在初始化 load 后和每步结束调用 checkpoint_manager.update_weights，采样结束后 sleep replicas。base fit 在完成 step 后保存，随后执行 mode hook；parameter_sync_step 可包含多次局部更新，数据源在中途耗尽会报错，不能当干净的完整步。自定义数据 EOF 的最终 save/eval 使用最近完成步，finally 关闭 reader/TQ；这些本地状态不证明远端全部旧请求已停止。
 
 HCU父仓如果patchMegatron的asyncpreload，联查父仓和固定MCore依赖确认D2H实际阻塞/异步、后台hosttensor所有权及staging完成边界，不能由外层async_save名称判断实现。本页只解释官方实现，不将私有patch细节复制为上游事实。
 
@@ -157,3 +220,16 @@ OOM先查每rank的weights/KV恢复时序和peak；版本错查传输backend/缓
 - [verl/utils/qat/compressed_tensors.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/utils/qat/compressed_tensors.py)
 - [verl/workers/engine/base.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/workers/engine/base.py)
 - [verl/workers/engine/megatron/transformer_impl.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/workers/engine/megatron/transformer_impl.py)
+
+
+## 2026-11-18 固定消费者
+
+- [README.md](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/README.md)
+- [verl/trainer/main_ppo.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/main_ppo.py)
+- [verl/trainer/ppo/v1/__init__.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/ppo/v1/__init__.py)
+- [verl/trainer/ppo/v1/trainer_base.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/ppo/v1/trainer_base.py)
+- [verl/trainer/ppo/v1/trainer_sync.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/trainer/ppo/v1/trainer_sync.py)
+- [verl/workers/engine_workers.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/engine_workers.py)
+- [verl/workers/engine/megatron/transformer_impl.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/engine/megatron/transformer_impl.py)
+- [verl/workers/rollout/sglang_rollout/sglang_rollout.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/rollout/sglang_rollout/sglang_rollout.py)
+- [verl/workers/rollout/sglang_rollout/http_server_engine.py](https://github.com/verl-project/verl/blob/b0871fd89d19329d8c9ed58e5402b11dcf920b64/verl/workers/rollout/sglang_rollout/http_server_engine.py)

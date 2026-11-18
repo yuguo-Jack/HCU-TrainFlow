@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: README.md
@@ -82,7 +82,38 @@ sources:
   path: torchtitan/rl/generator/vllm/model_wrapper.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: dfd3054a05f24eefa3e7bfaa5ffc24433700ede8579e53d8371277ae9a0f56e8
-
+- source: pytorch-torchtitan
+  path: torchtitan/models/base/module.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 3b275b99acbcfbf8ea2990560d612567fef4b565908a82c4bd177b021e7a7f24
+- source: pytorch-torchtitan
+  path: torchtitan/models/base/model.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 0ecf77477c71fd9ec70d5726e0e7b3f75bf233518d4fdd3cecf24fcd80dcb016
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/flops.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 08ea0e0c3fd760f355a1c139b73c1da04f5bc6d3922af233014799f3cdb1192f
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/pipeline_parallel.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 115833c627aaeaed1ca47e1fe8615183bb2316a738d5587fa6d31fa74507f13d
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/ACTIVATION_REMAT.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: b885d1cde8dbed2d3d793cf897787ad39fcd1b74359a16e041fcbb626ce15f8d
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator/model.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: d0cd8f39610905786265c3b8926e33f23285533d9b1e1dc5013d411e78c7d7df
+- source: pytorch-torchtitan
+  path: torchtitan/rl/model_state_dict_transport.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 13f48f0ed2b0a6b422000979b5463895c5e474f621932e5ffe24cf9eef9f5592
+- source: pytorch-torchtitan
+  path: torchtitan/config/transform/disable_moe_load_balancing.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 6cc86786d375364ed32b0f894f35649a017e782f41fa81582516c08bb772904e
 pr_sources:
 - pr-pytorch--torchtitan-5277
 - pr-pytorch--torchtitan-5280
@@ -139,11 +170,11 @@ pr_sources:
 
 根 `Trainer.Config.precision` / RL `Controller.Config.precision` → `TrainingEngine(precision=...)` → FSDP/autocast、checkpoint export 与 RL transfer；`training` 不再拥有旧 dtype 字段。`model.local_compile.regions` → `LocalCompileConfig.apply()` 绑定命名区域及 always-compiled helpers。Graph 实现在 `distributed/accelerator_graph.py`，FSDP partial-backward/grouped-forward 私有状态隔离在 `distributed/fsdp_lifecycle.py`。
 
-RL 加载追 `VLLMModelWrapper.load_model_state_dict(fetch)`；`model_state_dict_load_mode` 决定 CPU 预取还是逐组直接读取 StorageVolume。不能继续以旧 `load_state_dict` hooks 或 trainer `_setup_staging_model_state_dict` 作为当前入口。
+RL 加载追 `rl/generator/model.py::ModelStateDictLoader.load(fetch)`；`model_state_dict_load_mode` 决定 CPU 预取还是逐组直接读取 StorageVolume。不能继续以旧 `load_state_dict` hooks 或 trainer `_setup_staging_model_state_dict` 作为当前入口。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/README.md)
 - [torchtitan_recipes/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan_recipes/README.md)
@@ -173,3 +204,23 @@ RL 加载追 `VLLMModelWrapper.load_model_state_dict(fetch)`；`model_state_dict
 - [torchtitan/distributed/fsdp_lifecycle.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/fsdp_lifecycle.py)
 
 - [torchtitan/rl/generator/vllm/model_wrapper.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/vllm/model_wrapper.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+当前问题定位新增以下实际入口：
+
+| 责任 | 当前入口与迁移边界 |
+| --- | --- |
+| remat 文档与 block 策略 | `distributed/ACTIVATION_REMAT.md`、`activation_remat.py`；旧 `REMAT.md` 已删除，历史 PR 链接仍按原提交读 |
+| SPMD 边界 | `models/base/module.py` 只按 `input_shardings/output_shardings` 检查类型，不再自动做旧 `in_src/in_dst/out_src/out_dst` redistribution；沿真实模型 compute/collective 调用追踪 |
+| FLOPs/参数计数 | `BaseModel.Config.get_parameter_counts/build_flops_estimator` → `TrainingEngine` 预处理 → `ForwardBackwardResult.num_flops` → Trainer 的 DP 统计；不是固定每 token 值 |
+| 生成模型与加载 | `rl/generator/model.py::build_inference_model/ModelStateDictLoader.load`；vLLM wrapper 消费这层，不再自己定义完整加载实现 |
+| 权重传输 | `rl/model_state_dict_transport.py` 和 `rl/MODEL_STATE_DICT_TRANSPORT.md`；与显式 None 的 TorchStore 分开 |
+| RL 默认 | `config/transform/disable_moe_load_balancing.py`；旧 `FreezeMoERoutingTransform` 删除，router gate 仍训练 |
+
+`split_module` 已从 PP 私有 helper 提升为导出符号，但不代表任意模型/metadata 都能 PP；DeepSeek V4 对 fake PP 明确拒绝。新入口与旧版本的准确使用条件分别保留，避免把目录迁移当作后端支持扩大。
+
+固定入口：[torchtitan/models/base/module.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/base/module.py)；[torchtitan/models/base/model.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/base/model.py)；[torchtitan/models/common/flops.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/common/flops.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

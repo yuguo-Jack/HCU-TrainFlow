@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: selected mechanisms, recipes and tests at pinned official source; not every
+  model/backend and no HCU runtime execution
 sources:
 - source: deepspeedai-deepspeed
   path: deepspeed/runtime/pipe/engine.py
@@ -53,6 +54,31 @@ sources:
   path: tests/unit/checkpoint/test_fp32_master_only.py
   commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
   sha256: a34af0cfe6a58b63d750cdd9931bd742444b3bede860817c61dfc1395f4a9c28
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/engine.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 97cf4fac9f0cfdb1e1ac5a289d2a4ec312843274c4c1c08bb6e8c1225c9de75e
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/stage_1_and_2.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 61e0f21a348f3c98c44c32225ab25e1beddced12f36388a578acb1a608a8a454
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/stage3.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: d0abe8464970a378791847f64599395a26fbf5cca830676d9dffb4da5ddea1e3
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/pipe/engine.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: b47c092258b80d0474004371e267068833ac5ec430549dcef193aedf64857f8c
+- source: deepspeedai-deepspeed
+  path: tests/unit/checkpoint/test_fp32_master_only.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: 205e583a6b0ff43742ab29b160f927ff52cc90d705f39df10b11e52e6af19b28
+- source: deepspeedai-deepspeed
+  path: tests/unit/checkpoint/test_zero_optimizer.py
+  commit: 5420b75de3226e95b6412ed2d95380c0a819c89a
+  sha256: a61fb6f33376df909cfa3f6d5a25014fa919b35700df8e2d71337a8db1627d9a
+retrieved_on: '2026-11-18'
 ---
 
 # DeepSpeed Pipeline：1F1B、batch、activation 与 checkpoint
@@ -102,12 +128,12 @@ PP/TP rank 不增加独立训练样本，不用总 world size 代替 DP。改变
 
 ### 恢复模式与 FP32 master 来源
 
-2026-11-04 复核 `d8241a9ba266405e1a58fadf19e24b2370f6d7fa` 的 `DeepSpeedEngine.load_checkpoint`、stage1/2和stage3消费者，模式应明确记录：
+2026-11-18 对固定 `5420b75de3226e95b6412ed2d95380c0a819c89a` 的 `DeepSpeedEngine.load_checkpoint`、stage1/2、stage3 及测试继续复核；保留 2026-11-04 的固定证据解释其原版本，当前模式应明确记录：
 
 | 模式 | 当前权重/状态来源 |
 | --- | --- |
 | 完整ZeRO，加载optimizer | 必须读取保存的FP32 master与optimizer状态 |
-| 完整ZeRO，`load_optimizer_states=False` | 仍读保存的FP32 master，optimizer moments等保持新建状态；scheduler开关另行控制 |
+| 完整ZeRO，`load_optimizer_states=False` | 仍读保存的FP32 master，不加载保存的optimizer moments；当前engine已有state并不自动清空，scheduler开关另行控制 |
 | `load_module_only=True`，native ZeRO-1/2 | 从已载模型权重重建FP32 master；不是完整续训 |
 | module-only，Universal ZeRO-1/2 | 先从Universal FP32读模型，再刷新master |
 | module-only，ZeRO-3 | 模型文件没有全部partition参数，仍读保存FP32分片 |
@@ -116,9 +142,13 @@ PP/TP rank 不增加独立训练样本，不用总 world size 代替 DP。改变
 
 native DP数变化仅允许elastic ZeRO-1/2、checkpoint本身非rigid且不加载optimizer状态，读取所有保存分片后重分配FP32权重；ZeRO-3和带optimizer的native resize被拒绝。Universal仍受模型/布局metadata约束。相同step、相同输入的恢复对照要区分这些模式，关闭optimizer后下一步更新自然可能不同，不能宣称无损续训。
 
-已阅读新增 [`test_fp32_master_only.py`](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/tests/unit/checkpoint/test_fp32_master_only.py)：用 ZeRO-2/BF16 和 CPU/Gloo，将保存 master 改为不落在 BF16 网格的值，分别断言完整 no-optimizer 保留精确 FP32、module-only 使用低精度模型值、缺分片完整加载报错；另覆盖 DP2→DP1 的 Universal 与 native elastic 限制。它验证的设计边界不是所有 ZeRO-3/NVMe/模型布局的运行结论，本轮没有执行这些上游测试。
+已阅读新增 [`test_fp32_master_only.py`](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/tests/unit/checkpoint/test_fp32_master_only.py)：原有设计用 ZeRO-2/BF16，将保存 master 改为不落在 BF16 网格的值，分别断言完整 no-optimizer 保留精确 FP32、module-only 使用低精度模型值、缺分片完整加载报错；另覆盖 DP2→DP1 的 Universal 与 native elastic 限制。它验证的设计边界不是所有 ZeRO-3/NVMe/模型布局的运行结论，本轮没有执行这些上游测试。
 
-PP的 `TrainSchedule.steps/num_pipe_buffers` 和ZeRO<2兼容断言未变；本轮pipe engine只把吞吐timer换成 `elapsed_total(reset=True)`。历史吞吐对照需核对累计窗口，不能把计时口径变化误判成1F1B调度优化。
+2026-11-18 的 [checkpoint 测试](https://github.com/deepspeedai/DeepSpeed/blob/5420b75de3226e95b6412ed2d95380c0a819c89a/tests/unit/checkpoint/test_fp32_master_only.py) 不再统一硬编码 Gloo：device fixture 在分布式初始化前选择设备，DP2 fixture 还要求真实可用设备数量，不能把旧 CPU/Gloo 说明当成新测试的全部环境。新增测试确认 native serial checkpoint 在进入 rank 间 recv 等待链前先检查 FP32 分片是否存在，缺失时硬失败，避免其他本地 rank 因提前 recv 卡住；这不是训练 PP 1F1B 的调度变更。
+
+`load_optimizer_states=False` 的含义是不读取保存的 optimizer，并非重置当前 engine：新测试还让已 step 的 engine 先持有 moments，no-optimizer Universal load 后继续保持该 state，且可用公开 safe API 修改。fresh engine 的空 moments、已运行 engine 的旧 moments及保存 checkpoint 的 moments 是三种来源，必须明确选择，不能把 no-optimizer load 宣称为等价续训。native 旧分片的 clip/overflow/dynamic-scale 也只在加载 optimizer 时恢复。BF16 master 的 CPUAdam 另有 stage1/2/3 测试要求 FP32 moments 不经 BF16 舍入；参数存储 dtype 不决定 optimizer-state dtype。Stage3 的 Universal→AutoTP 恢复按目标参数 metadata 决定词表/TP slicing，即使保存对象为 bare tensor，仍先解析 TP shard 再切 DP partition。
+
+PP 的 `TrainSchedule.steps/num_pipe_buffers` 内容与 ZeRO<2 兼容断言未变；本轮 pipe engine 仅清理调试/注释，既有 `elapsed_total(reset=True)` 已在 2026-11-04 的版本存在。历史吞吐对照继续核对累计窗口，不能把旧计时口径变化或本轮注释清理误判成调度优化。
 
 ## 验证、诊断和更新
 

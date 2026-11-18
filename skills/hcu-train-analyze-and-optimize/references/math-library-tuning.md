@@ -61,12 +61,14 @@ hipBLASLt/grouped GEMM 当前仍按真实复现交接，不套用 rocBLAS 自行
 
 1. **取真实复现。** 短诊断中开启本版支持的命令日志（常见为 `MIOPEN_ENABLE_LOGGING_CMD=1`，详细日志按需用 `MIOPEN_LOG_LEVEL=6`），分 rank/PID 保存原生日志中的 `MIOpenDriver` 命令、调用次数和模型位置。核对完整 tensor 描述符、布局/精度、前反向及算子特有参数；Driver 不能等价重放的图融合/其他算子交最小 API 或框架复现，不只交维度表。正式性能测试关闭日志。
 2. **优先比较布局。** HCU 上 NHWC 常有优势，可作为卷积热点的优先候选；仍须比较实际 shape 的前向/反向、相邻算子转换、显存与整步收益，不能全局强制，也不把内存格式变换混成模型维度变化。
-3. **评估先选优、后复用。** 适用路径先覆盖代表性 shape 进行搜索，再新起进程复用兼容的选优记录/编译缓存。已查 HCU DTK 26.10 手册与固定源码中，可验证 `MIOPEN_FIND_MODE=1`（全面搜索）→ `3`（默认 Hybrid）这一路径；`4` 为快速匹配，不保证最快。执行时以实际 HCU 版本与消费者为准，不能照搬 AMD 编号/默认值，也不能混淆 Find、ENFORCE、Fusion 或框架 benchmark 控制。先确认缓存落盘与命中，再分别比较启动和稳态；仅跑过几步不等于所有形状完成 tune，也不保证生成了新 kernel。
+3. **评估先选优、后复用。** 适用路径先覆盖代表性 shape 进行搜索，再新起进程复用兼容的选优记录/编译缓存。旧 HCU DTK 26.10 手册与固定源码的 `MIOPEN_FIND_MODE=1`（全面搜索）→ `3`（Hybrid）仅作为对应版本的查证起点；其中旧 `4` 快速匹配说明不能沿用为新 API 的通用值。当前公开 ConvolutionFindMode 的 4 保留不用，环境模式、descriptor setter、handle policy 与框架 benchmark 须分别追实际消费者和覆盖顺序，不能照搬另一版本的编号/默认值。先确认缓存落盘与命中，再分别比较启动和稳态；仅跑过几步不等于所有形状完成 tune，也不保证生成了新 kernel。
 4. **仍有差距就提需求。** 将 Driver/最小复现、原日志、布局/模式/缓存状态、workspace、版本及可靠性能差距交用户协调数学库；收到优化结果后回到局部正确性、模型整步及阶段 loss 验证。不要求先重写 MIOpen 才能报需求。
 
 新增 handle 策略或 cached solution 接入时，再检查框架实际调用：当前 `c8f09a6b704e39a7a937268b81d259b82e446903` 中默认 `miopenTuningPolicyNone=1` 沿用环境 FindMode，`Search=3` 在已读卷积/BatchNorm 路径强制 Normal Find。其他策略枚举存在不证明已经实现同名清库/写库动作；环境值有静态缓存，进程内修改后须确认实际状态。`MIOPEN_FIND_KERNEL_TIMES` 改的是选优测量重复数，正式步时须计入真实启动成本并单列稳态，不能解释为训练算子永久执行多遍。
 
 `GetCachedSolution` 查询 FDB，`CacheMiss` 不自动执行 Find；`RunCachedSolution` 精确选择 solver、不自动换解，但仍可能准备或编译 kernel。调用方明确 miss/错误的重新选优策略，核对确定性、problem、workspace、solver 与库/设备身份；跨进程重新创建 handle、descriptor 和 buffer，只复用无指针 metadata。它不是跨 DTK/硬件的稳定 ABI 保证。先用原策略作对照，验实际执行与数值/性能后再保留，不能以缓存查询成功代替模型验收。
+
+当前 `592d0c39b4d5876f82292a4e52f2282ff48c4044` 的 [公开 FindMode 声明](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen/-/blob/592d0c39b4d5876f82292a4e52f2282ff48c4044/include/miopen/miopen.h) 区分 Normal=1、Fast=2（FDB miss 后 Immediate fallback）、Hybrid=3（miss 后 Find）与 DynamicHybrid=5（miss 后跳过非 dynamic kernel）；环境可覆盖默认。setter 能读写枚举不证明每条 solver 路线都已测试，内部环境扩展也不能由公共枚举反推。新增 forward/dgrad/wgrad `GetWorkSpaceSizeRange` 的[实现](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen/-/blob/592d0c39b4d5876f82292a4e52f2282ff48c4044/src/convolution_descriptor.cpp)只统计未禁用且适用的 Hipnn solver，关闭 search/perfdb 访问，无适用项会失败；它不是全后端 autotune，也不能当成模型峰值显存或当前 wheel 公共 ABI 已支持的证明。
 
 Find 模式的既有查证基点为 [66f318c4](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen/-/blob/66f318c40eebc72b5812590239451fbe28bbc99d/src/include/miopen/find_controls.hpp) 和 DTK 26.10 手册 §4.1；当前增量另对照 [c8f09a6b 的消费者](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen/-/blob/c8f09a6b704e39a7a937268b81d259b82e446903/src/convolution_descriptor.cpp)，通过大库 `miopen-tuning-and-cached-solution` 追 API、测试和边界。这里保留处理方法，不复制 HCU 仓 Wiki；具体命令/缓存路径随部署查证，读写范围沿用任务规则。本轮为资料与源码核对，未新增硬件调优实测。
 

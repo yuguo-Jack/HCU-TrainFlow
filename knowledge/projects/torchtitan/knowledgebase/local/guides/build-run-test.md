@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: pyproject.toml
@@ -90,7 +90,42 @@ sources:
   path: tests/unit_tests/cpu/test_trainer.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: b9681edfc274190ede7dcbba70a8bc82b814b51d4facf3618feb3c6961e0891d
-
+- source: pytorch-torchtitan
+  path: .ci/docker/requirements.txt
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 2a90200bd0a8cbd376c5d83ab262feac30fa366ffc311b55d66aee90a9b9691e
+- source: pytorch-torchtitan
+  path: README.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 4c4c416b469463defac6b9302dbe006ff5d0a1b5d47dc1f8323d0ef012abe8da
+- source: pytorch-torchtitan
+  path: tests/README.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 7716cab20e63a1f1e53fc6035a1aedf26e0da0f443469be16bf6e53220fc914f
+- source: pytorch-torchtitan
+  path: torchtitan/config/configs.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: b35c74c3921b51c651f6f20633d2f38293f5b02d1d45af7b155bd285054a7207
+- source: pytorch-torchtitan
+  path: torchtitan/models/kimi_k3/README.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: f51b7fe6c31466c3f2e34f92ca534ee91fe93ae3671789630dc4b236f027ca8b
+- source: pytorch-torchtitan
+  path: torchtitan/components/checkpointer/base.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 7535af216c3ef95b5dc6c271ad85de68e0355e345e16f8321a8fe218bcb11bba
+- source: pytorch-torchtitan
+  path: tests/unit_tests/cpu/test_trainer.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 7321283e603f94e5a9df8788a9f4f11d7ed83904aa2054c816e9cddef60bc9be
+- source: pytorch-torchtitan
+  path: tests/rl/unit_tests/cpu/test_engine_loop.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 248e42247c43e0274a5d1d2efdf2e99021fa12fb8a6fda80d848c6d2bc21da6d
+- source: pytorch-torchtitan
+  path: tests/rl/unit_tests/cpu/test_model_state_dict_transport.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 545285c0ebd315d40efa3de6bb8be82f0f5a0799b03ca5292530befe74fa04fe
 pr_sources:
 - pr-pytorch--torchtitan-5277
 - pr-pytorch--torchtitan-5280
@@ -166,7 +201,7 @@ Graph 开关为 `training.disable_accelerator_graphs`、`training.accelerator_gr
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [pyproject.toml](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/pyproject.toml)
 - [.ci/docker/requirements.txt](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/.ci/docker/requirements.txt)
@@ -203,3 +238,16 @@ Graph 开关为 `training.disable_accelerator_graphs`、`training.accelerator_gr
 - [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/training_engine.py)
 
 - [tests/unit_tests/cpu/test_trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/unit_tests/cpu/test_trainer.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+同一固定主线的 `.ci/docker/requirements.txt` 已改为 `datasets>=5.2.0`、`attn-gym==0.0.20`，并将 `torch_remat` 从 0.2.2 改成固定 Git `6c05e8d8d6895a60dcc02674af0774b28155b5af`，用于 `SavedTensorInfo.region`；pyarrow<26、spmd_types==0.3.1 和 torch_checkpointing==0.1.1 保持。README 的 TorchAO 安装也改为读取 CI pins 文件，而非任意最新 nightly。下方旧版本清单只解释其原提交，不能混装成当前组合；本轮没有安装这些训练依赖。
+
+`PrecisionConfig(dtype="bfloat16", param_dtype="float32")` 现在硬拒；HF 最终导出也拒绝任何冻结参数（含 LoRA），需提前选完整 native checkpoint/支持的导出方案。Kimi 标准 flavor 与 debugmodel 已为文本模型，多模态使用 `_mm` flavor，并在 `Trainer.Config.vision_processor` 配置对应模型的预处理。
+
+测试 README 新增硬件 skip 清单入口，不能把跳过的模型/设备组合算成通过。已读当前 CPU trainer/engine-loop/权重 transport 的测试设计，覆盖 FLOPs、图输出复制、drain/hot-swap、分片覆盖及 dtype 边界；未执行这些上游测试或真实设备通信。
+
+固定入口：[.ci/docker/requirements.txt](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/.ci/docker/requirements.txt)；[README.md](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/README.md)；[tests/README.md](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/tests/README.md)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

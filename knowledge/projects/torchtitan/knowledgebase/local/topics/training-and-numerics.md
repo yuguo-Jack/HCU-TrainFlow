@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/trainer.py
@@ -70,7 +70,46 @@ sources:
   path: torchtitan/distributed/utils.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 11910a1dcf3c54cec3896998e21222ae4c3053901fdaf6d89670dd722108da7f
-
+- source: pytorch-torchtitan
+  path: torchtitan/config/configs.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: b35c74c3921b51c651f6f20633d2f38293f5b02d1d45af7b155bd285054a7207
+- source: pytorch-torchtitan
+  path: torchtitan/models/base/module.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 3b275b99acbcfbf8ea2990560d612567fef4b565908a82c4bd177b021e7a7f24
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/fsdp.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: a66e3d1d82ed1c792bcfa2b3070f36bcb2f97cb809e1d1c8e5b213768232744d
+- source: pytorch-torchtitan
+  path: torchtitan/models/base/model.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 0ecf77477c71fd9ec70d5726e0e7b3f75bf233518d4fdd3cecf24fcd80dcb016
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/flops.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 08ea0e0c3fd760f355a1c139b73c1da04f5bc6d3922af233014799f3cdb1192f
+- source: pytorch-torchtitan
+  path: torchtitan/training_engine.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: ecbe72af3cdf4eba9d8093eb07c6178b2046063e87e574ed0d43f5861ab982ab
+- source: pytorch-torchtitan
+  path: torchtitan/trainer.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: dea5f4c0c83494e39ca87bfc93b07e125f57b6df31af9802d5fb429cc8d5b011
+- source: pytorch-torchtitan
+  path: torchtitan/components/validator.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 078a75df30d9eda1ff5bb5ca08b8ce6e1b46235decfaa2f7a04d8a323057a120
+- source: pytorch-torchtitan
+  path: torchtitan/components/optim/optim.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 30a1535bf4b634d2ed78ed6d57494fcce796322ab15be68e90c3ad22ea5bbf54
+- source: pytorch-torchtitan
+  path: tests/unit_tests/cpu/test_trainer.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 7321283e603f94e5a9df8788a9f4f11d7ed83904aa2054c816e9cddef60bc9be
 pr_sources:
 - pr-pytorch--torchtitan-5250
 - pr-pytorch--torchtitan-5137
@@ -135,7 +174,7 @@ BF16 optimizer states 将 Adam/AdamW moment 与模型计算精度解耦：参数
 
 首个 WGRAD 也有精度变化：有更宽的 `weight.grad_dtype` 时，当前 Linear 直接让 GEMM输出该 dtype，跳过先舍入到 BF16再由autograd转FP32；`test_first_wgrad_is_produced_in_grad_dtype` 单独检查这一点。历史PR的首步bitwise结论不能覆盖这次变化，详见[案例](../cases/inplace-wgrad-accumulation.md)。
 
-每个新 `Optim` 实例第一次 `step()` 在更新图外通过当前 `device_module` 等待已初始化设备工作，再释放未使用的缓存；CPU 模型不会因此初始化尚未使用的 CUDA/XPU context，为NCCL外部分配让出空间；恢复到非零step也执行。它不释放live tensor/Graph pool、不减小通信buffer，也不能解决此前forward/backward或后续分配失败；性能基线应把这次首轮等待单列。
+当前非 XPU 的新 `Optim` 实例第一次 `step()` 在更新图外通过当前 `device_module` 等待已初始化设备工作，再释放未使用的缓存；CPU 模型不会因此初始化尚未使用的 CUDA/XPU context，为NCCL外部分配让出空间；恢复到非零step也执行。它不释放live tensor/Graph pool、不减小通信buffer，也不能解决此前forward/backward或后续分配失败；性能基线应把这次首轮等待单列。
 
 ## Clip 接口与 DistMuon 通信的独立约束
 
@@ -145,7 +184,7 @@ BF16 optimizer states 将 Adam/AdamW moment 与模型计算精度解耦：参数
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/trainer.py)
 - [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/training_engine.py)
@@ -171,3 +210,16 @@ BF16 optimizer states 将 Adam/AdamW moment 与模型计算精度解耦：参数
 - [torchtitan/rl/trainer/trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/trainer/trainer.py)
 
 - [torchtitan/distributed/utils.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/utils.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+根精度现在拒绝基础 `dtype="bfloat16"` 却要求 `param_dtype="float32"` 的组合。meta-built 模型的冻结参数在 FSDP 记录 dtype 前用较窄 param dtype 存储，受保护参数保持自身精度；tied 参数身份和 tensor-subclass 内部存储通过 swap 保留。`Module._apply` 对已物化 buffer 禁止改变 dtype，但失败前的参数/子模块可能已转换，失败后应从固定配置重建，不能假定自动回滚。直接赋值/加载也不获得恢复 canonical dtype 的保证。
+
+模型接口改为 `get_parameter_counts` 与 `build_flops_estimator`。预处理按原始 CPU microbatch 输入计算全逻辑模型 FLOPs，位于 capture/replay 与 SDC 重放之外；graphable 内部函数只返回 `LossAndMetrics`，外层才附加 `ForwardBackwardResult.num_flops`。该值未按 TP/PP/EP 分片，CP rank 相同，Trainer 仅在 DP mesh 平均，不能再用旧静态 `num_flops_per_token` 或乘一次 CP。当前 decoder attention 仍用配置 seq_len 而非 packed document 的逐条长度，估计也不计重算、elementwise 和 causal sparsity；不能替代 profiler 的实际设备工作量。
+
+训练和 validation 现通过 `combine_loss_metrics` 按各 key 的 sum/max 合并 microbatch 和 loss mesh，PP 只由持有末 stage 的 rank 产出。validation 的 sum 类指标再按全局有效 token 归一化，graph 输出 clone 后才累计。核对反传分母、日志归约和指标含义，不能把每个 metric 都解释为微批均值。首次 `Optim.step` 的同步/empty_cache 现在明确跳过 XPU，其余实际设备路径仍按源码执行；旧“每设备一律执行”结论不再适用。
+
+固定入口：[torchtitan/config/configs.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/config/configs.py)；[torchtitan/models/base/module.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/base/module.py)；[torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/distributed/fsdp.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

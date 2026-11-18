@@ -23,16 +23,20 @@
 | AITER INT8/FP8 AG 与 RS | 当前 AG 保留原始位，RS 则进行数值 SUM：INT8 为 INT32 累加后保留低 8 位；E4M3FN/E5M2 为按源 rank 顺序 FP32 累加后一次非饱和 RNE 转回，不隐含外部 scale。FNUZ 与不满足 custom 准入的 FP8 RS 明确拒绝，原生 RCCL FP8 SUM 不能作为等价兜底。用匹配合同的独立 oracle 覆盖特殊值、溢出、dim、对齐、变化输入及真实 rank 组。 |
 | 原地输出与回退 | 先看准入和真实输出所有权。当前 AITER 的低层 RS 成功写 out 仍返回 None，不支持时也可能返回 None；不能按返回值再调用一次 collective。框架封装返回新 tensor 与底层原地接口分别检查，失败须在修改数据前安全回退或明确报错。 |
 | rocSHMEM 的 host collective 路由 | 按当前消费者固定版本检查策略。新 develop 分节点内/间和 collective 读取 `ROCSHMEM_RCCL_MIN_SIZE_INTRA` / `_INTER`，旧单一变量不再读取，等于阈值也可进入 RCCL；alltoallv 的 device counts 使 size 阈值不适用。team capability、symbol 和组内配置一致性仍有门禁；不要把一套默认阈值固化到所有拓扑或旧消费者。 |
-| EP async、plan 与工作区视图 | 返回 event 不自动取消 host planning、跨 rank 校验或单 in-flight 限制。MoonEP 当前 async 返回完成 event，消费 stream 需要 join；zero-copy 视图仍受 generation/工作区寿命约束。UltraEP 专家副本梯度归并会消费并清零源缓冲，异常后直接重跑并非幂等；优化器前的 grad join、新权重消费前的 weight join 及迭代 flush 分别验收。 |
+| EP async、plan 与工作区视图 | 分清公开发行与内部试验路径。MoonEP `1.0.1@af969425` 的公共同步 Buffer 只支持 `zero_copy=True`，成功返回 `event=None`；`zero_copy=False` 在 data-plane 前拒绝，`async_finish=True`、Graph、跨节点/RDMA 与多 in-flight 均在发行声明之外。不能沿旧 async 描述等待一个不存在的 event，或把 copy 模式当 fallback。视图仍受 generation/工作区寿命约束。UltraEP 专家副本梯度归并会消费并清零源缓冲，异常后直接重跑并非幂等；优化器前的 grad join、新权重消费前的 weight join 及迭代 flush 分别验收。 |
 | rocSHMEM 注册内存与 on-stream collective | 新版 VMM 对称注册返回管理的 VA alias，RMA 目标与注销使用返回值；原地址、导出 handle 和 alias 的释放分别核对。不能继续用旧单 heap 偏移解释所有指针。执行依赖与存储寿命分别保证，注销前等待全部相关 stream/context；SDMA NBI 在发起操作的同 context `quiet`，不能以另一 context 的空状态证明完成。同 team 的跨 stream 排序仍要求各 PE 逻辑 collective 顺序一致；独立库的新接口不自动进入旧 DeepEP/UltraEP 父锁。 |
 
 能力依据从大库 `aiter-int8-fp8-collective-contract`、`rocshmem-hcu-engineering`、`moonep-g1-contributor-capacity` 和 `ultraep-replica-gradient-lifecycle` 进入。以上说明对应版本的检查点，不能当成任意已安装库都支持的能力表。微基准含 copy-in、host 直接绑定或 Graph event 的口径须明确；某 dtype/拓扑的局部收益不推导成模型整步收益。
 
-状态读取优化也要保留失败协议。MoonEP 当前源码的 error-only、predicated segment、deferred retire 与 native chain 是不同路径；部分 launch 已入队后失败，不能回退重跑并重复写入。其独立 skip-readback 实验会生成 synthetic 成功状态，已有非零副本偏置的反例，不能推荐为训练提速配置。正常路径 host read 变少不证明首错、跨 rank 读退休或 zero-copy 寿命已消除；按 `moonep-release-contract` 核对全部 rank 的有效配置、故障传播和多 generation。
+状态读取优化也要保留失败协议。MoonEP 历史/内部试验中的 error-only、predicated segment、deferred retire 与 native chain 是不同路径，不因此成为当前公开发行的 async 能力；部分 launch 已入队后失败，不能回退重跑并重复写入。其独立 skip-readback 实验会生成 synthetic 成功状态，已有非零副本偏置的反例，不能推荐为训练提速配置。正常路径 host read 变少不证明首错、跨 rank 读退休或 zero-copy 寿命已消除；按大库 `moonep-release-contract` 及固定 [发行声明](http://42.228.13.241:10068/dcutoolkit/deeplearing/MoonEP/-/blob/af969425074c81a507c93ab750f665943ad28220/RELEASE_COMPATIBILITY.md)核对实际 wheel/ABI、全部 rank 的有效配置与故障传播。旧 wheel/hash 不能代表新发行制品。
 
-新增融合接口优先核对消费者输出。当前 DeepEP `dispatch_scatter` 仅支持非 cached 节点内路径，旧返回形式保留但 token-order `recv_x` 载荷不再是融合结果；调用者须消费 expert-major scatter 目标。`combine_gather` 的适用范围更窄，不能仅以同名 API 接入跨节点或 MNVL。测试有效 token、padding、空专家、量化 scale、输出所有权与回退，再比较省下的 layout kernel 和完整 MoE 时间。
+新增融合接口优先核对消费者输出。DeepEP `main@1be01550add7583644e9e3150e25ba92ffddc06d` 的 [dispatch_scatter](http://42.228.13.241:10068/dcutoolkit/deeplearing/DeepEP/-/blob/1be01550add7583644e9e3150e25ba92ffddc06d/deep_ep/buffer.py) 已支持 cached 节点内重放：复用 forward 的 index/layout，不能再次传 `scatter_m_indices` 或 `scatter_topk_weights`；index 中的 −1 路由跳过，payload/FP8 scales 配套写入 expert-major 目标。不能由此推导相同融合接口已覆盖跨节点、低延迟或 MNVL。
+
+forward 的 scatter 权重与 `combine_gather` 的 `topk_weights` 不是同一种数据：后者是展开载荷行的**权重梯度**，经 gather index 和贡献 rank 归约回原发送 token 顺序。调用者提供 `out/out_topk_weights` 时保留形状、dtype、device、连续性及共享存储生命周期；写出成功仍需正确完成语义。`drop_on_overflow` 默认关闭，显式开启后以调用者输出容量和 expert alignment 截断，丢弃路由 index=−1、weight=0，**不重新归一化剩余权重**，须按改变路由/数值语义的候选验收，不能静默当显存优化。容量 stats、有效 token、padding、空专家、FP8 scales 和变化输入一起测试后，再比较完整 MoE 时间。`set_num_sms` 的偶数检查与初始化跨 RDMA/LL 分支的三倍数检查分开，不能将旧测试说明当成 setter 的统一限制。
 
 UltraEP 内部 HIP placement 的 final-plan 慢路径会退回当前 domain 的 master-only，早期 fast/precheck 成功仍可使用副本。这是保护性回退，不能继续假定副本负载均衡收益或将未再挂住写成根因已修复。记录实际 placement、fallback 频率、token/概率与 master quota 守恒及最慢 rank 时间；梯度消费/清零和 weight/grad join 继续按原合同验证。上述新增契约均为固定源码审阅，未新增多卡或训练实测。
+
+大专家空间另验计数边界。UltraEP `cea1f4b0808378c4ad1d80eec53c239c0416d6ab` 的 [dense load 计数](http://42.228.13.241:10068/dcutoolkit/deeplearing/ultraep/-/blob/cea1f4b0808378c4ad1d80eec53c239c0416d6ab/csrc/kernels/load_compute.cu) 对 L>1024 使用双维 stride/64 位行偏移，不能把旧线程布局导致的崩溃当固有专家容量上限；同时覆盖 L=0、T=0、各 rank 不同 token 数与精确计数守恒。其独立 load/placement 测试不证明专家计算、梯度归并、动态 placement 或 loss 已通过。UCCL 升级涉及 runtime top-k 或 per-expert batching 时，检查新的独立 grid-sync counter 与 workspace 容量；诊断 proxy gap 时结合 CQE、post、CPU 调度，不能仅凭长 poll 判网络慢。
 
 ## 2. 先调调度与粒度，再判断融合
 

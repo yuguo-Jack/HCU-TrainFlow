@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tests-reviewed
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
@@ -48,6 +48,18 @@ sources:
   path: transformer_engine/pytorch/csrc/common.h
   commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: c8a954fd7cd80e3c8b0ca8e3a584d1944edef330b8e8200020a0d9fcf0528de2
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/csrc/extensions/normalization.cpp
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 601ff099c756b2dbb8d3a8fed6c719733bc6555a59d5a1668a858f6b8dbf88ef
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/csrc/quantizer.cpp
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: a0a0c31867e1f89b46ee932bae8f08344716c86745071f68e7469302ea0639a5
+- source: nvidia-transformerengine
+  path: tests/pytorch/test_numerics.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 20c3e01ed8b263c94d2eb7208fbc86c9de2ff478c720935fbfbf32618f046eaf
 pr_sources:
 - pr-nvidia--transformerengine-3657
 ---
@@ -66,7 +78,7 @@ PR 的独立 review 曾要求补充 profiling，并质疑该 kernel 的速度上
 
 `pytorch/csrc/extensions/normalization.cpp` 根据 quantizer/输出布局准备 tensor → `nvte_rmsnorm_fwd` 的 `rmsnorm_api.cpp` → `is_supported_by_te_rmsnorm_fwd_mxfp8` → `rmsnorm_fwd_mxfp8` / `launch_rmsnorm_fwd_mxfp8` → rsigma 与 tile 量化 kernel。
 
-MXFP8 输出且实现支持时，默认可以走 TE 路径；显式请求 cuDNN 会影响普通布局的选择。**GEMM-swizzled scale 输出要求 TE 支持**，不满足时会报错，而不是偷偷换成不同布局。源码保留 workspace-query 协议：查询返回一个字节的占位大小，不能由此推断实现需要一整块中间激活。
+MXFP8 输出且实现支持时，默认可以走 TE 路径。当前 `8e89d3ad8b2c` 的 cuDNN 路线可先产生 compact scale，再通过 `prepare_compact_norm_output` 与 `nvte_swizzle_scaling_factors` 写入 GEMM 所需布局；显式 cuDNN 与 `optimize_for_gemm` 决定是否需要该中间 scale buffer。因此不能再把 GEMM-swizzled 一概判为只能由 TE 直接输出。查询、实际 kernel、辅助 swizzle 分别计入调用链和时间，不能将 workspace-query 的占位返回解释为完整中间激活开销。
 
 | 条件 | 源码约束与原因 |
 | --- | --- |
@@ -90,6 +102,8 @@ MXFP8 输出且实现支持时，默认可以走 TE 路径；显式请求 cuDNN 
 不要为了消除报错伪造输出 shape 或丢弃布局约束；保留已有可靠的 normalize→量化路线，或在需要两向输出且满足合同的消费者中使用已测试的 row+column 形式，并计入额外存储。若采用 column-only，先修复实际包装/公共 API 并增加相应输出、scale 和异常输入测试；2D/unfused 路线应单独检查，不能由这个缺口推断全部量化路径均失败。
 
 2026-11-04 在 `720b25258be3b60f482afff8aef00d4cad88fa16` 重新沿 create_tensor→TensorWrapper setter→workspace-query 检查：本案例的 RMSNorm API、CUDA 实现和直接测试原件未变；变化集中于 NVFP4 alignment helper 与 grouped tensor 的 row-scaled 元数据，未修复上述普通 MXFP8 column-only 的 rowwise shape 检查。继续保留这一入口缺口及未设备重现状态，不能因为通用 tensor 文件有变化就删除原限制。
+
+当前 `8e89d3ad8b2c` 重新核对后，默认 TE `FULLY_FUSED`、`out=None`、仅 columnwise 的上述静态路径仍由 `MXFP8Quantizer::create_tensor` 仅设置 columnwise data，不能宣称 rowwise-shape 前置检查已修复。显式 cuDNN 新 compact/swizzle 路线与已有 `out` 的 `convert_and_update_tensor` 路线应分别检查，不用这条默认路径观察外推所有 norm/量化入口。没有运行设备复现，也未据 CUDA 内部 colwise 分支删除公开包装限制。
 
 ## HCU 借鉴与上限评估
 

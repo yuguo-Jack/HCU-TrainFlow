@@ -10,7 +10,7 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 coverage: reviewed implementation chains and official guides; not all models, backends
   or HCU runtime qualification
 sources:
@@ -102,6 +102,63 @@ sources:
   path: vllm/distributed/weight_transfer/m2n_layout.py
   commit: 25e7c5728d834335288d080e1c36810fa111d4da
   sha256: 133025922445c66c74cd0e18706f7fa216752e886d0820b943467a4530d814fa
+- source: vllm-project-vllm
+  path: vllm/distributed/weight_transfer/base.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 759287da422a0f524ebe92c9ae7dd8d6f1b403e37426a57a5726fe02ad8a860c
+- source: vllm-project-vllm
+  path: vllm/distributed/weight_transfer/nccl_common.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: bd7229a47991d3171ff9cddc12307e8bc00af119b0b8684fbf7395047349f322
+- source: vllm-project-vllm
+  path: vllm/distributed/weight_transfer/nccl_engine.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 86b91366176e91408cef6dfe5c901fc8cb272dbbfbbc3d0dbfc892a028d94575
+- source: vllm-project-vllm
+  path: vllm/model_executor/model_loader/reload/__init__.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 7c34a846b4ce8afbe0f9b19217ca04d78aa89a24fdfeab9973307d8cafef17f4
+- source: vllm-project-vllm
+  path: vllm/model_executor/model_loader/reload/plan.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 8193ec5fd7cb1164b6abf042b0d19cc1c5b925b69bfff2eb5b5c5ebad741cf95
+- source: vllm-project-vllm
+  path: vllm/model_executor/model_loader/reload/lifecycle.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: c143aa12944b7af3deabc22552f8f6b66b7b28b6f506a0b0d22dbeec6d11351f
+- source: vllm-project-vllm
+  path: tests/model_executor/model_loader/test_reload_lifecycle.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 978354b6b50cb4b8a65d8ff5579976f633e35c43f64ae54e1b718e2ae8367e57
+- source: vllm-project-vllm
+  path: docs/training/weight_transfer/sharded_rdt.md
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: d7124b63716753147ba6ef75b9c987b783e0a4d9ec7715b60f314e529fb9dd24
+- source: vllm-project-vllm
+  path: vllm/distributed/weight_transfer/sharded_rdt_common.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: dc488c5b0781656c3e296886ad064f2395e4960691c61035fc5896d7dfd40bbc
+- source: vllm-project-vllm
+  path: vllm/distributed/weight_transfer/sharded_rdt_engine.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 506a36d957652c4735b02e1741cab38fd6d6005ff9ac31d3ed79c72fc390740b
+- source: vllm-project-vllm
+  path: vllm/distributed/weight_transfer/sharded_rdt_trainer.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 1e16d8db6f8803301aacdd3bf35905ff75402341cd9833d468c2ddbba4c0f5b1
+- source: vllm-project-vllm
+  path: vllm/v1/worker/gpu_worker.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 75b922226252564f93c4c40c95a59f55ffc799025c63d0901050e3c19663f342
+- source: vllm-project-vllm
+  path: tests/v1/worker/test_gpu_worker_weight_transfer.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 872ad5c1f1bbe613b8cd0c763e30c915c843fee306f0acb4c351dc52a427fee9
+- source: vllm-project-vllm
+  path: vllm/v1/worker/gpu/model_runner.py
+  commit: a2915755bf1dcaf80623e36d079713bfb190c1e7
+  sha256: 70a936dbacfae65e227c12e731b5ca4e3003bbdeb12ab2b6987503f6f4f2a5bb
+retrieved_on: '2026-11-18'
 ---
 
 # vLLM 权重传输：双端协议、逐层物化与版本提交
@@ -167,7 +224,7 @@ receiver 只 pull 所需 slice，但 producer 仍按 group gather/export；`Para
 
 `update_weights` 路线会把 scatter/量化交给后台队列；成功返回的 `finish_weight_update` 才表明 drain 已等待 process/quant 队列、stream 和 pending free RPC，避免迟到 credit 污染下一轮。process 错误可能在 free RPC 排空前抛出，失败后不能直接复用 credit 开新轮。shutdown 会记录 drain 异常并限时 join 线程，因此 shutdown 返回不能补作 finish 成功证据。`live_consumer_ids` 必须由所有训练 rank 使用相同集合；降级只改变本轮 live 数，原 provisioning geometry 仍冻结，不自动提供重分片或版本事务恢复。
 
-当前指南要求 Ray >=2.56、NIXL、Ray executor 及训推分离，并拒绝 EPLB。参数名字与 group 必须覆盖同一 leaf 的依赖，完整发布仍检查全部副本、后处理、版本和新 policy 的 logits。这里核对的是固定实现的选择与完成语义；未执行 RDMA、Ray 或 HCU 集成验证。
+当前 GPU staging 要求 Ray >=2.56，host staging 另需 >=2.58；同时需要 NIXL、Ray executor 及训推分离，并拒绝 EPLB。参数名字与 group 必须覆盖同一 leaf 的依赖，完整发布仍检查全部副本、后处理、版本和新 policy 的 logits。这里核对的是固定实现的选择与完成语义；未执行 RDMA、Ray 或 HCU 集成验证。
 
 ## 版本提交、测试与回退
 
@@ -177,7 +234,7 @@ Packed NCCL 在超过阈值后闭合 chunk，跨阈值 tensor 仍在本块；pac
 
 官方文档明确：update 失败可留下部分已加载参数，health 仍200，随后 finish 被拒绝。恢复生成前应从可信完整参数重新执行 start→全部 update→finish 并检查每个副本；不能继续半轮、只补最后一块或只写 version。GPU worker 还在 draft 更新期间处理共享的未量化 LM head 与量化副本，finish 后重新派生副本，失败时恢复相应 head 状态；target/draft、scale 和缓存需单独回归。
 
-worker 当前在 start 可能移动权重之前就登记 target/draft 的 incomplete 标记，只有该对象成功 finish 才清除；一次失败不能靠更新另一对象来核销。update 异常会结束活动会话并保留 incomplete，finish 异常则须区分 direct-reload 等路径，不能假设所有 backend 都已结束会话或都允许直接重试。临时 KV 借用在收尾释放不等于参数已恢复，成功 target finish 后还会重置 LoRA 状态；失败后先核对实际状态，再决定完整重载或重建。
+worker 当前在 start 可能移动权重之前就登记 target/draft 的 incomplete 标记，只有该对象成功 finish 才清除；一次失败不能靠更新另一对象来核销。update 异常会结束活动会话并保留 incomplete，finish 异常则须区分 direct-reload 等路径，不能假设所有 backend 都已结束会话或都允许直接重试。临时 KV 借用在收尾释放不等于参数已恢复，成功 target finish 后还调用 on_target_weights_replaced 后处理 hook；失败后先核对实际状态，再决定完整重载或重建。
 
 暂停生成并处理在途请求→start→传输全部group→load/postprocess→finish(版本)→全部副本查证→恢复生成。`/update_weight_version`仅改标签不能代替装载；control回执、参数校验、固定prompt logits/logprob与样本policy版本共同构成证据。
 
@@ -212,3 +269,34 @@ OOM/卡住时分别量化export/gather、packing、发送、receive、load/postp
 - [vllm/distributed/weight_transfer/m2n_layout.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/vllm/distributed/weight_transfer/m2n_layout.py)
 
 本页在 2026-11-04 按具体机制阅读上述固定源码和教程（大型 engine/trainer/test 文件为选段追踪，非逐文件全读）；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+
+
+## 2026-11-18 固定主线复核
+
+以下按 `a2915755bf1dcaf80623e36d079713bfb190c1e7` 实际消费者说明，旧固定证据仍保留其版本范围。
+
+### NCCL opt-in LoadPlan 与统一 source
+
+`WeightSource` 的 cached metadata / iter_full / iter_local、同序 owners 与全 rank 参与合同继续适用，本轮 base 的主要变化是文档格式和小 dataclass slots，不把它描述成再次替换整套 source API。NCCL 新 `NCCLTrainerInitInfo.use_load_plan=False` 为显式选项，init 把完整 metadata 发给 worker，所有 trainer rank 在 RPC/broadcast 前检查 name/dtype/shape 是 init manifest 的子集；计划失败后 trainer 仍保留该约束直到 re-init，避免 worker 中途拒绝而 trainer 卡在 collective。
+
+plan 只允许 `VLLM_RELOAD_MODE=direct`、无 EPLB/online quantization；init 前置拒绝在 start_reload 之前，失败会关闭新通信组。首次 **target** `start_weight_update` 在 start_reload 还原真实存储布局后才 `plan_loads`，因此会增加首次 trace 时间；draft 不走此计划。仅逐字节 copy 的名字可直接写计划中的 live tensor，需算术/转换或复合 loader 的名字按计划 fallback 送完整 tensor 调真实 load_weights，若组合 loader 自身不写任何目标则规划拒绝。计划目标只可在 start/finish 之间写，不可当可读快照。
+
+first-start 规划失败已经可能留下 mid-reload，worker 取消计划并抛异常；后续普通 loader 路线需要重新完整装入可信权重，而非只重试最后 chunk。重新规划需 re-init。**这是 NCCL 的失败/回退选择，不改变 RDT FakeRDTTensor 静态 bake 的无自动 loader fallback 合同**。reload lifecycle 的 process-wide active flag 在 finish 调用下层 finalize 前即清除，故 flag=False 本身不能证明 post-load 成功。
+
+### RDT host staging、并行 stream 和 credit
+
+`staging_device="gpu"`、`stages_in_flight=1` 保留默认；host staging 需 Ray≥2.58（GPU 仍≥2.56）、CUDA host-register/NIXL 等实际准入。有效 lane 是 owner-connected trainer stream 数与 stages_in_flight 的较小值，至少1；每 worker pool 为 `lanes × num_rdt_buffers × rounded_slot_size`，slot 由最大 packed chunk 向上按256MiB取整或更大 presize floor。不能按 PP 数直接假定 lane 数，也不能把 pool 计入已限制的 KV memory utilization。
+
+host slot 先精确分配 pageable 范围，再整块 cudaHostRegister/NIXL 注册，随后异步 scatter 到 GPU；这里不用 Torch pinned allocator 的幂次取整/缓存。复用 slot 前先等本代 queued/done 计数，证明该代 read-done event 已记录，再等 event 证明 GPU 已读完；只等上次记录的 event 不够。sync0 固定串行完成双端注册，sync1 才启流水；lane 等旧 slot 时让其他在途 lane 进展，不能以一个阻塞 wait 引入跨 replica 自造死锁。
+
+re-init 在候选 routing/plan/pool 中构造，预注册和处理线程启动成功才 commit；已有 worker 后必须保持 staging-device/lanes/K 几何。失败只释放本次新 slot，旧活跃 slot 保留。host slot 释放先 NIXL deregister 再 host unregister；任一步失败或线程未停仍可能读取时，park 并保持 page-locked/强引用，记录泄留而不强行释放。它是故障保护，不能承诺 shutdown 后主机内存全回收。
+
+free_group 增加 sync_idx：早到的未来轮 credit 留待相应 begin_sync，过期轮不计入当前，避免 rank 起步不同丢信号或错放下一轮。但各 rank 的 live set/初始geometry仍需一致，finish 继续 drain process/quant/stream/free RPC；失败不能用 shutdown 返回或一个 flag 替代完成证明。
+
+### Worker 事务边界
+
+Worker 仍在 start 可能移动参数前标记 target/draft incomplete；update 失败结束 session 并保留 incomplete。direct finish 失败结束 session，不能就地重试 finish；layerwise 仍须按其真实失败状态判断。成功结束才核销对应对象，不能靠更新另一对象清掉失败。
+
+target 完成后改调用 `model_runner.on_target_weights_replaced()`，draft 不调用它。当前实际 hook 在存在 draft 时刷新其派生的 quantized LM-head copies，不是旧 reset_lora_state，也不表示 KV/encoder/mm cache 都已清理；普通 runner.reload_weights 另外显式重置 encoder/mm caches，传权消费者须沿自己的完整控制链查证。incomplete 核销与 session 结束发生在该 hook 前，因此最终 RPC/hook、真实参数/post-load/KV与全部副本版本还要一起查证。`prefill_context_kv_only` 已释放 draft weights 时明确拒绝 draft 更新。来源 worker/reload 生命周期单测已读，未执行上游 CPU/GPU/RDMA；错误后不声明整模型原子回滚。
+
+固定入口：[vllm/distributed/weight_transfer/base.py](https://github.com/vllm-project/vllm/blob/a2915755bf1dcaf80623e36d079713bfb190c1e7/vllm/distributed/weight_transfer/base.py)；[vllm/distributed/weight_transfer/nccl_common.py](https://github.com/vllm-project/vllm/blob/a2915755bf1dcaf80623e36d079713bfb190c1e7/vllm/distributed/weight_transfer/nccl_common.py)；[vllm/distributed/weight_transfer/nccl_engine.py](https://github.com/vllm-project/vllm/blob/a2915755bf1dcaf80623e36d079713bfb190c1e7/vllm/distributed/weight_transfer/nccl_engine.py)。本轮没有安装、运行上游测试或执行 HCU 训推验收。

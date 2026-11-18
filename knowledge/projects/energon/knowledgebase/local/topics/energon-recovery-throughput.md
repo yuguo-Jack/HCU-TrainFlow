@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: nvidia-megatron-energon
   path: src/megatron/energon/loader.py
@@ -73,7 +74,31 @@ sources:
   path: tests/test_filter_index.py
   commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: bfa633d01e0fdd6405f738bf1ccebf8d10138c1e229ff59767f28b7b6e25af4a
-retrieved_on: '2026-11-04'
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/flavors/common/dataset_sampler.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: fe88bf4ed490ef249b253face9960ba55f597ddb604b77b07d56793bdfad7e3f
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/flavors/common/filter_index.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 982449eded6142e111df7304da31918932f9e98988d77b56059c4387305b9fda
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/rng.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 23f5973dc29c5faaa6eb2f996e3e934a29fb6f7ef864310f4fa352e76469391a
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/task_encoder/base.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 53e8825432d392d36f5308d77dbbbbffb28a8a0ae96d018959e15fde5f641403
+- source: nvidia-megatron-energon
+  path: tests/test_dataset.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 4925982cdbc7511e73968600f453356317638e97033cc895a5e4a1b3f1c75f34
+- source: nvidia-megatron-energon
+  path: tests/test_filter_index.py
+  commit: 8ba04a3aa4200725a136258e00a6facf3bd15acd
+  sha256: 817a9f7bb7533d4792252b8843ae0b32a29cd50194d7ada8a0f0dcccce00a464
+retrieved_on: '2026-11-18'
 ---
 
 # Energon：数据空泡、Snapshot 恢复、Worker 与资源生命周期
@@ -92,7 +117,7 @@ workers会预取未来样本，训练真正消费位置落后于worker当前状�
 
 ## 2a. 大数据集索引常量内存与版本边界
 
-当前 `DatasetSampler._pending_slices` 已使用此前引入的常量内存实现，本轮该文件字节未变；它不分配/保存全量随机待处理列表：无 shuffle 返回 `range(num_slices)`；有限 epoch shuffle 以 `FeistelPermutation(num_slices × shuffle_over_epochs, seed)` 按位置取索引，再对 num_slices 取模；replacement 模式继续用 worker RNG 逐个抽取。Feistel 在下一幂次二进制域做默认八轮置换，对域外结果 cycle walking，形成目标范围内的双射。它降低随 slice 数增长的索引内存，但每次查找有整数运算/cycle walking 的 CPU 成本，不代表所有加载场景都更快。
+当前 `DatasetSampler._pending_slices` 已使用此前引入的常量内存实现，2026-11-04 该文件字节未变；2026-11-18 已增加下述顺序流路径；它不分配/保存全量随机待处理列表：无 shuffle 返回 `range(num_slices)`；有限 epoch shuffle 以 `FeistelPermutation(num_slices × shuffle_over_epochs, seed)` 按位置取索引，再对 num_slices 取模；replacement 模式继续用 worker RNG 逐个抽取。Feistel 在下一幂次二进制域做默认八轮置换，对域外结果 cycle walking，形成目标范围内的双射。它降低随 slice 数增长的索引内存，但每次查找有整数运算/cycle walking 的 CPU 成本，不代表所有加载场景都更快。
 
 `Sharder` 对 `max_samples_per_sequence==1` 直接创建每 worker 的 range offsets，`_clean_offsets` 保留 range，sampler 配置也用 start/stop/step 表达，避免为每个 sample 展开 Python offsets 列表。此特化不代表所有 sequence cap、packing buffer 或 reader 缓存都变为常量内存。
 
@@ -123,6 +148,14 @@ watchdog默认超时诊断/是否fail由策略决定，不负责节点隔离或�
 2026-11-04 检索固定 `e33bbe768a4f7a629377a365c8af9a7b98b1219e`：所引 loader / worker / sampler / sharder / RNG / 测试及恢复文档字节不变，保留 snapshot+消费 offset、Feistel 状态、DP×worker 缩扩与资源关闭限制。compatibility 文档新增 `test_filter_index.py` 作为格式/工厂变更验证入口；Recipe 新 filter 将改变可见样本身份，旧 state 或同名数据路径不能自动证明过滤索引兼容。验证应增加 filter 索引与源数据的版本、样本 ID / 有效 token、保存后未来序列复现，并明确原 Bridge 的同 DP size 消费者限制仍然成立。本轮没有执行这些测试。
 
 补采的 filter 实现将原样本整数地址映射为过滤后的地址：manifest sidecar 位于 `.nv-meta/filter_<name>.json/.idx`，单文件数据使用旁置同名后缀，当前索引版本为 2。`FilterView` 验证版本、shard 名/顺序、原样本计数和 primary 文件 byte size，并按选定 split 的 shard 顺序翻译；它不校验 companion 文件或完整内容 hash，同大小改写不由这些检查自动识别。`TranslatedIndexReader` 将 restore key 的整数位置改为 filtered_index，故必须保留对应 filter 原件，不能换 filter 后沿用旧位置。上游 `test_filtered_training_recipe_checkpoint`、stale filter、分 rank/worker、BINIDX passthrough 测试提供特定范围参考，本轮未运行，不扩大为全部格式/分布式恢复兼容。
+
+## 顺序 slice reader 与新增 packing 的恢复边界
+
+在 `8ba04a3aa4200725a136258e00a6facf3bd15acd`，sampler 对支持 `SequentialSampleReader` 的 reader 延迟建立每个 active slice 的 `iter_slice(current, stop)`；整数 restore key 与 active slice 位置继续保存，打开的 iterator 不进入 checkpoint。`reset_state_own`、新迭代和 close 会关闭旧流，耗尽 slice 时也显式释放，恢复后从保存位置重新开流。普通 indexed reader 保留原逐样本读取路线。filter 的顺序 reader 仍负责 filtered_index 的身份翻译，不能用原始 sample index 替代它。
+
+连续流改变 IO 路径，不改变此前 filter 文件/样本身份的校验限制，也不提供 Bridge 任意 DP size 的状态迁移。验证增加活跃 slice 中途保存、filtered reader、提前 break/close/再用，以及未来样本序列与 FD/host RSS；上游新增测试是已读证据，本轮没有执行。
+
+Streaming packing 的 partial slice 和 pushback 也属于数据状态；保存/恢复必须与相同 encoder、混合单位、mask/有效 token 目标绑定。`SystemRng` 只保存/恢复 CPU 侧随机流，设备随机变换需要自管状态。新增或变化的数据路径先做同版本中断恢复，再评估旧 checkpoint 迁移，不能由吞吐或样本总数相同判定恢复正确。
 
 ## 固定证据与复核范围
 

@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/models/README.md
@@ -70,7 +70,38 @@ sources:
   path: torchtitan/training_engine.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 2ffe06874d3a03ccc91d407f1bc91d5f2beaa9c746738dd3a3646f1c800a798f
-
+- source: pytorch-torchtitan
+  path: torchtitan/models/kimi_k3/README.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: f51b7fe6c31466c3f2e34f92ca534ee91fe93ae3671789630dc4b236f027ca8b
+- source: pytorch-torchtitan
+  path: torchtitan/models/kimi_k3/model.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 193d30294ad0f71c9db8ebd7a1be3e48464622dd0b5a3631e723cd38407b509f
+- source: pytorch-torchtitan
+  path: torchtitan/models/kimi_k3/flavors.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 0f8966ae361475e48d98e72006ec994fc137ad0a9fe92849f0ee3eb98e7b4bc1
+- source: pytorch-torchtitan
+  path: torchtitan_recipes/tests/models/kimi_k3.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 18b57c4957464815ee8edef8573e2b040c74c6ce4b71bbd4b65398ee4dbd893d
+- source: pytorch-torchtitan
+  path: torchtitan/components/data/README.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 07f85111168ec5ff325180108a8efe3860d6ca5385ba18379b2b9cc69bf21aa3
+- source: pytorch-torchtitan
+  path: torchtitan/trainer.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: dea5f4c0c83494e39ca87bfc93b07e125f57b6df31af9802d5fb429cc8d5b011
+- source: pytorch-torchtitan
+  path: torchtitan/rl/controller/controller.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: e7111207a551e02c27b80dc4059b354353204dcbfb1d1af6ab54f423212c941b
+- source: pytorch-torchtitan
+  path: torchtitan/models/deepseek_v4/model.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 21c7d4dc246642db8558e9d608f9f7ac6d3e72b22a94d8c51393bf805deb1905
 pr_sources:
 - pr-pytorch--torchtitan-5280
 - pr-pytorch--torchtitan-5266
@@ -118,7 +149,7 @@ Kimi K3当前统一为 `layer.attention`（KDA或KimiMLA）和 `layer.feed_forwa
 
 本固定提交Kimi构造器/测试recipe默认attention backend改为varlen，DistMuon的owned/block/per-expert compute layout显式使用BF16。TP布局的既有限制仍应由当前recipe断言验证；不能为了避开varlen依赖或布局约束悄悄换attention/optimizer而继续称作原配方。原Attention Residual局部算子案例的算法与历史实验范围保留，当前调用者变化另行核对。
 
-README还新增Muse-Spark-Open模型与已验证text recipe的导航，但源码中的多模态结构不等于各模态/阶段都有同样验证。RL默认的FP32 LM head、冻结router和aux loss移除见[TitanRL](titanrl.md)，不能套用到同名模型的监督预训练。
+README还新增Muse-Spark-Open模型与已验证text recipe的导航，但源码中的多模态结构不等于各模态/阶段都有同样验证。RL默认的FP32 LM head、冻结expert bias和aux loss移除（router gate继续训练）见[TitanRL](titanrl.md)，不能套用到同名模型的监督预训练。
 
 ## 当前输入与 MLA 消费者
 
@@ -128,7 +159,7 @@ Kimi flavor 的 `wkv_b` 与 packed KV 维度现在进入 `MLAAttention.Config`�
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/models/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/README.md)
 - [torchtitan/models/kimi_k3/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/kimi_k3/README.md)
@@ -161,3 +192,16 @@ FLUX 图像配方依赖专门的 `.ci/docker/requirements-flux.txt`；图片特�
 - [torchtitan/rl/generator/vllm/model_wrapper.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/vllm/model_wrapper.py)
 
 - [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/training_engine.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+Kimi 的 `Kimi-K3`/`debugmodel` 现在明确是 `KimiK3Model` 文本 decoder，`Kimi-K3_mm`/`debugmodel_mm` 才构造带 MoonViT 的 `KimiK3MultimodalModel`。多模态 parity 记录对应 `_mm` debug，不是所有文本/完整模型组合的证明。视觉编码器不再是同一个配置里随意移除的 optional 字段。
+
+图像/视频处理由模型定义的 `Trainer.Config.vision_processor` 构建一次，传到 dataloader、样本处理和 collator；RL renderer、generator 与 trainer 也使用相同配置。resize、patch grid、归一化、顺序和 M-RoPE/1D position 必须对齐，不能把旧 dataset processor 名称或固定 patch 参数拼入新入口。Kimi vision scatter 前显式 gather 完整 TP sequence，再恢复 residual 布局；文本/视觉通信不相同。
+
+DeepSeek V4 的 PP 传递 `[T,hc_mult,D]`，token IDs 通过 `input_ids_T` kwargs 抵达后续 stage 的 hash routing，只有末 stage 持有 hc_head/norm。fake process-group 的静态 metadata 仍只描述 `[T,D]`，因此明确拒绝 fake PP；不能用缺少这一维的模拟通过宣称真实 PP 资格。实际模型参数/FLOPs接口也已迁移，见[数值专题](training-and-numerics.md)。
+
+固定入口：[torchtitan/models/kimi_k3/README.md](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/kimi_k3/README.md)；[torchtitan/models/kimi_k3/model.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/kimi_k3/model.py)；[torchtitan/models/kimi_k3/flavors.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/kimi_k3/flavors.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
@@ -46,6 +46,22 @@ sources:
   sha256: a360753931c52ab40d573da739ed74d9d730d7c0063c3634116f89b7075f6c7c
   url: https://docs.nvidia.com/cudnn/quickstart/
   revision_kind: web-content-fingerprint
+- source: nvidia-cudnn-frontend
+  path: setup.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 14fe4051a384e1f624ca9105c4a239087cc4437471c867efd515d54dbaf24bda
+- source: nvidia-cudnn-frontend
+  path: pyproject.toml
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 7b370ace448b410cfd0f8246ecfd28af7d09b193f6598609503df5774f6e14df
+- source: nvidia-cudnn-frontend
+  path: CMakeLists.txt
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 0dfb163cb8b9ac285e92e2ba496ad335bfbcaf619aa2b0352d524449c4499965
+- source: nvidia-cudnn-frontend
+  path: python/cudnn/__init__.py
+  commit: 623ad8ff498acdaa860fbc8191d2afeaea90e400
+  sha256: 4327a86e9640c60e480f6fa56af7b7154096bb9c17dd3b2d00803e1413da4100
 ---
 # cuDNN Frontend 编译安装、运行示例与测试路线
 
@@ -70,6 +86,12 @@ C++ Frontend 主要通过头文件接入；编译应用和样例仍需匹配 CUD
 
 新官网 Quick Start 使用 `with cudnn.Graph(...) as graph` 构图，退出 context 时 validate/build，之后 `graph(...)` 执行；inputs/outputs 名字列表确定调用次序。构图时只用 tensor 元数据，执行时才读值。这个高级入口与显式 pygraph 的计划/工作区生命周期可以对照，不能把教程的矩阵尺寸、宽松误差和性能当训练验收；主控不因此安装 NV 包。
 
+## 本固定版本的可选构建变化
+
+`623ad8ff498a` 的项目版本仍为1.33.0；可选 JAX extra 的共同下界已提高到 `jax>=0.9.1`，包括 BSA 等 JAX kernel，不能沿旧≥0.5条件拼装环境。`CUDNN_FRONTEND_PYTHON_FREE_THREADED=ON|OFF` 新增显式构建选项，默认 OFF；已有 stable-ABI 的 CPython/GIL 限制继续独立核对，开关存在不证明全部可选 engine 已通过无 GIL 并发测试。
+
+C++ 新增默认关闭的 `CUDNN_FRONTEND_BUILD_AOT_SM120` 及独立 `cudnn_frontend_aot_loader` 目标；只链接原头文件目标不增加动态加载依赖。AOT 目标需要所述 CuTeDSL/SM120 环境，不表示一般 C++ 接入必须编译它。以上仅用于官方 NV 配方诊断，TrainFlow 和 HCU 运行环境不因此安装或升级这些包。
+
 ## 正确性与性能验收
 
 单测至少覆盖 forward、backward、非连续布局、变长/边界、RNG、不同 head/专家规模及实际需要的精度。运行数为零、unsupported、skip 与 fallback 分开报告。性能分构图/编译、首次调用、稳态 execute 和模型墙钟；同步位置与 workspace 分配边界保持一致。
@@ -88,3 +110,10 @@ C++ Frontend 主要通过头文件接入；编译应用和样例仍需匹配 CUD
 - [nvidia-cudnn-frontend-docs: quickstart](https://docs.nvidia.com/cudnn/quickstart/)
 
 本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+
+## 2026-11-18 固定依据
+
+- [setup.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/setup.py)
+- [pyproject.toml](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/pyproject.toml)
+- [CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/CMakeLists.txt)
+- [python/cudnn/__init__.py](https://github.com/NVIDIA/cudnn-frontend/blob/623ad8ff498acdaa860fbc8191d2afeaea90e400/python/cudnn/__init__.py)

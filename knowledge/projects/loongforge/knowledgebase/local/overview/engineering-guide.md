@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: baidu-baige-loongforge
   path: README.md
@@ -69,7 +70,15 @@ sources:
   path: loongforge/embodied/optimizer/tensor_wise_optimizer/tensor_wise_optimizer.py
   commit: 042a68102395b9f4024d1a61084592c4c618371a
   sha256: 2b9ff23e99cd892377b60a30e739b6d863e8e0d8ea2b7c8f10531401bbba3cdf
-retrieved_on: '2026-11-04'
+- source: baidu-baige-loongforge
+  path: README.md
+  commit: f42f0613034c140e98d056b63ce8a37c694d1f81
+  sha256: 44ab8e9706385a0c9612c356a6e635b78a0a6accc96be68b80349471f4d0e0ec
+- source: baidu-baige-loongforge
+  path: loongforge/embodied/distributed/checkpoint.py
+  commit: f42f0613034c140e98d056b63ce8a37c694d1f81
+  sha256: b6bd1b8ef3f4a31672f873a673d112ce7b8f42270ba9c2a67c0b042a7ad06331
+retrieved_on: '2026-11-18'
 ---
 
 # LoongForge：两类训练入口、DP 均衡、EP 重叠与状态恢复
@@ -148,6 +157,12 @@ DP不均查各rank的sequence²/视觉负载及拟合残差，不仅看token数�
 本轮保留依据：父仓 parser、trainer builder、pyproject、setup_env、DP 均衡与 E2E 指南所引字节未变，故保留两栈入口、空 base dependencies、gpu/xpu extras、环境写入边界与数据/日志根契约。README 新增 LingBot-VLA-v2 / tensor_wise Muon 路线，embodied README 修正 GR00T 目录拼写且更新 Pi0.5 上游性能数字；这些不代表本页已审计新模型、所有 optimizer 或任何 HCU 实测。checkpoint 和 BaseTrainer 已有实质变化，按对应消费者复核，不能继续称实现/测试全部未变。
 
 2026-11-04 固定 GitHub 最近10条 release 观测包含 [`v0.2.0`](https://github.com/baidu-baige/LoongForge/releases/tag/v0.2.0)（2026-08-20）。本页所述当前 DCP/TensorWise/MLA 行为来自所固定 master 与父树 gitlink，未证明全部进入 v0.2.0，也未将 API 的 target_commitish 当作解析后的完整提交。
+
+## 当前父锁与 legacy optimizer 设备恢复
+
+2026-11-18 固定父仓 `f42f0613034c140e98d056b63ce8a37c694d1f81`，完整固定树选择 Loong-Megatron `343efbf4029e81697d32f54c6f924ac82b06677f`；这与子仓独立 HEAD 无关。README 新增模型/具身结果是上游发现入口，不将其中数字作为 HCU 或任意配方的收益。
+
+`_resume_legacy` 的普通 `optimizer.load_state_dict` 分支现在随后调用 `_move_fused_step_to_param_device`：仅对 fused/capturable 参数组，把 tensor 类型的 Adam step 放回参数设备；ZeRO 逐个定位真正持有 state 的局部 optimizer。它不把所有 optimizer state 搬上设备，也不改写 dmuon/FSDP 专用加载分支。恢复验收须检查实际 step 所在设备与下一次更新；此前 tensor-wise 保存/加载 payload 不对称的固定缺口未由此修复，仍保留原限制。
 
 ## 固定证据与复核范围
 

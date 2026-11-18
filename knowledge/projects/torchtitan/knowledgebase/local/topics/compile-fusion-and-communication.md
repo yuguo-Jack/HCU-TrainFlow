@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/config/OVERRIDE.md
@@ -102,7 +102,30 @@ sources:
   path: torchtitan/distributed/pipeline_parallel.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 21f503def70b1cb570be163729cacd4fd6c0ccb27d376c4ed1c15323495cb5bb
-
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/local_compile.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: b58a3f07b2851535630ec46413df47890d4b13922e65c405f65334a4739652eb
+- source: pytorch-torchtitan
+  path: torchtitan/models/base/module.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 3b275b99acbcfbf8ea2990560d612567fef4b565908a82c4bd177b021e7a7f24
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/linear/async_linear.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 42e17a54c0a4e8576d3107186e8394d6905194900a92afd2c12d3f051f3e2534
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/accelerator_graph.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: e9d6abb0abcb8d857ba73549d48371107c1b43cfd40c5685fc52d0ef7fe205a6
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/ACCELERATOR_GRAPH.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 963bae7feb7b5ff0c5e69ed73206e1694fa603fca8002e3d14863531a21a2ee9
+- source: pytorch-torchtitan
+  path: torchtitan/experiments/graph_trainer/README.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 102fba05624866c6f86881ac282e3cd0f0626c8ca19072bd3dc6b249aedd9508
 pr_sources:
 - pr-pytorch--torchtitan-5033
 - pr-pytorch--torchtitan-5250
@@ -172,7 +195,7 @@ DeepEP deferred-epilogue overlap（PR #5263）于 2026-11-04 官方 API 核对�
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/config/OVERRIDE.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/OVERRIDE.md)
 - [torchtitan/config/transform/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/transform/README.md)
@@ -207,3 +230,16 @@ DeepEP deferred-epilogue overlap（PR #5263）于 2026-11-04 官方 API 核对�
 - [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/training_engine.py)
 
 - [torchtitan/distributed/pipeline_parallel.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/pipeline_parallel.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+`LocalCompileConfig` 对命名 region 和 always-compiled helper 的顶层 async collective 输入先通过自定义 autograd Function 等待，再交给编译函数，避免 AOTAutograd 直接解包 `AsyncCollectiveTensor` 后丢掉 requires-grad 连接。这里只处理顶层 args/kwargs，不递归容器；需要同时验输入梯度、通信完成及编译命中，不能把显式 wait 当成可删除的性能损耗。
+
+Async Linear 在没有 dense sequence parallel（例如视觉 encoder）时回到普通 Linear，因为没有相应序列 collective 可 overlap；保留原地 WGRAD 的拒绝/禁用条件。Module 的 SPMD 边界从自动 redistribution 改为 `input_shardings/output_shardings` 类型检查，真正通信要沿模型显式调用追踪，旧 src/dst 配置不能照搬。
+
+Graph wrapper 删除了捕获前重复的显式 empty_cache；capture API 自己同步设备并释放未使用普通 cache，replay 不执行它，也不释放 live tensor/graph pool。GraphTrainer 新增注册 `compile.extra_passes` 的文档：导入并按名选择、依列表顺序在 joint graph 后期运行，未注册/重复名拒绝，替换节点须保留下游使用的 meta。该路径仍是独立实验接口，模型/shape和 HCU 支持分别核对。
+
+固定入口：[torchtitan/distributed/local_compile.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/distributed/local_compile.py)；[torchtitan/models/base/module.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/base/module.py)；[torchtitan/models/common/linear/async_linear.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/common/linear/async_linear.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

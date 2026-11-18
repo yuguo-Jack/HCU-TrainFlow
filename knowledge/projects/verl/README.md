@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: 0b3a233a8f456d90a8a6348dc2def630662ca8c912f860e345dd5a21ee24e2a0
+generated_body_sha256: 871fc5e4b480cc9c026423ff0e103f6020f9e67a3ec38625079f7ae220f0f059
 ---
 
 # verl
@@ -27,6 +27,7 @@ generated_body_sha256: 0b3a233a8f456d90a8a6348dc2def630662ca8c912f860e345dd5a21e
 
 - [volcengine-verl](https://github.com/verl-project/verl)
 - [选定官方文档原文](knowledgebase/upstream/docs/)
+- [已选定 PR 与固定证据](knowledgebase/upstream/prs/)
 - [固定源码阅读入口](knowledgebase/upstream/source-map/)
 
 普通 PR 通过官方原页联搜，正文、代码和讨论按需读取；已选定页面链接固定原件，历史材料由既有固定 Git 基线按需恢复。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。

@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/distributed/distributed_data_parallel.py
@@ -53,10 +54,51 @@ sources:
   path: megatron/core/full_cuda_graph.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: 8859a7946d168298e36af1f0ccb02d99c32e8b69a1055aaf155a5d31e628d78f
+- source: nvidia-megatron-lm
+  path: megatron/core/distributed/distributed_data_parallel.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 03fcdd20914b67df6076717e85230fe4eee193e5052acf999151b273e6352fa8
+- source: nvidia-megatron-lm
+  path: megatron/core/distributed/distributed_data_parallel_config.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: baa82944e137aa7b571898453348d8f57087a88b85436cca299abfe387101df9
+- source: nvidia-megatron-lm
+  path: megatron/core/distributed/param_and_grad_buffer.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 7c499c232cc76973892a04ea9e724fb296b763e28f852691f7bbe12440fa6c5d
+- source: nvidia-megatron-lm
+  path: megatron/core/full_cuda_graph.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 061169b2549b5381049a25fdc4a6c07e1040cb77b84432830a3f4e4bc7a83881
+- source: nvidia-megatron-lm
+  path: megatron/core/extensions/te_cuda_graphs.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 3f1b8d0a46a071bea2bec94a2017d25db0d8ad12da6d5fa92afa79c85029a036
+- source: nvidia-megatron-lm
+  path: megatron/core/pipeline_parallel/schedules.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 635f20cea400b18f32f5a6b2012c747b74df017c9e2770edf129395852a4580a
 retrieved_on: '2026-11-04'
 ---
 
 # Megatron 通信重叠：DP bucket、TP、PP与EP的依赖和限制
+
+## 2026-11-18：buffer 定稿和图执行的同步边界
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+DDP 在 wrapper 建立前调用 config.finalize，再按 optimizer/model 派生并校验真实 buffer policy；bucket 数/大小的解析带持久 resolution marker，保留已有解析值但不能在 buffer 建立后任意改 recipe。MXFP8 参数复用 grad storage 与 grad-buffer offload 不相容；对称参数池的分配与 group 注册不是同一动作，注销仍由实际注册者负责，不能用一次通用 deregister 回收所有 owner 的池。
+
+full_iteration 的 eager warmup 现在也在最终 shared capture stream 上运行，调用流与 warmup 流双向建立等待，避免 retained autograd 节点/None gradient 叶子的 stale-stream 问题。TE 图微批标记和 offload 专用同步入口另由 `extensions/te_cuda_graphs.py` 管理；删除旧同步调用而未接上新 owner 不能算等价迁移。重叠收益仍用 profiler-off 端到端关键路径，首次 capture/缓存和必要数值检查分别标记。
+
+### 本节固定证据
+
+- [megatron/core/distributed/distributed_data_parallel.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/distributed/distributed_data_parallel.py)
+- [megatron/core/distributed/distributed_data_parallel_config.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/distributed/distributed_data_parallel_config.py)
+- [megatron/core/distributed/param_and_grad_buffer.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/distributed/param_and_grad_buffer.py)
+- [megatron/core/full_cuda_graph.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/full_cuda_graph.py)
+- [megatron/core/extensions/te_cuda_graphs.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/extensions/te_cuda_graphs.py)
+- [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/pipeline_parallel/schedules.py)
 
 ## 先判断通信是哪种问题
 

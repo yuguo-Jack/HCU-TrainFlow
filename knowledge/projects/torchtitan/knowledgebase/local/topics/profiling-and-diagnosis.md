@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/observability/profiler.py
@@ -50,6 +50,42 @@ sources:
   path: torchtitan/components/optim/optim.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: b93bb590ff7c7eec2d1bd9c2668ad668bf3bee1e944fbe6b0e0415b2474e154b
+- source: pytorch-torchtitan
+  path: torchtitan/models/README.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 898429009818d47980f01d6da03989b6583caac574002b839b4d8a87ed272b2e
+- source: pytorch-torchtitan
+  path: torchtitan/training_engine.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: ecbe72af3cdf4eba9d8093eb07c6178b2046063e87e574ed0d43f5861ab982ab
+- source: pytorch-torchtitan
+  path: torchtitan/trainer.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: dea5f4c0c83494e39ca87bfc93b07e125f57b6df31af9802d5fb429cc8d5b011
+- source: pytorch-torchtitan
+  path: torchtitan/components/optim/optim.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 30a1535bf4b634d2ed78ed6d57494fcce796322ab15be68e90c3ad22ea5bbf54
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/accelerator_graph.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: e9d6abb0abcb8d857ba73549d48371107c1b43cfd40c5685fc52d0ef7fe205a6
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/ACCELERATOR_GRAPH.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 963bae7feb7b5ff0c5e69ed73206e1694fa603fca8002e3d14863531a21a2ee9
+- source: pytorch-torchtitan
+  path: torchtitan/observability/METRICS.md
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 34586f9f6e3485b2abd95907db856e69ee897e30e79a3eec31b302d1382909d3
+- source: pytorch-torchtitan
+  path: tests/unit_tests/cpu/test_trainer.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 7321283e603f94e5a9df8788a9f4f11d7ed83904aa2054c816e9cddef60bc9be
+- source: pytorch-torchtitan
+  path: torchtitan/rl/controller/controller.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: e7111207a551e02c27b80dc4059b354353204dcbfb1d1af6ab54f423212c941b
 ---
 # TorchTitan 性能采集、TraceLens 联动与问题定位
 
@@ -110,13 +146,13 @@ TorchTitan 自带 MFU/峰值表面向它支持的卡型；HCU 应使用已核实
 
 ## 当前启动/捕获窗口的额外事件
 
-首次 optimizer update 有一次当前已初始化设备的等待和 empty_cache；每个Graph wrapper首次capture前也释放未使用缓存。它们保留live tensor与Graph pool，不能据reserved短时下降推导模型常驻量减少。Graph的DEBUG memory日志按wrapper name与boundary记录allocated/reserved/active/inactive_split、peak和设备free；这些字段的层次不同，采样需对应同一阶段。wrapper命名可区分forward_backward、optimizer、validation，annotation由profiler导出路径消费。
+首次 optimizer update 的已初始化设备等待和 empty_cache 当前排除 XPU；Graph wrapper 不再额外调用 empty_cache，捕获 API 自己执行同步/清理。它们保留live tensor与Graph pool，不能据reserved短时下降推导模型常驻量减少。Graph 的 DEBUG memory 日志按当前仍保留的 wrapper boundary 记录allocated/reserved/active/inactive_split、peak和设备free；这些字段的层次不同，采样需对应同一阶段。wrapper命名可区分forward_backward、optimizer、validation，annotation由profiler导出路径消费。
 
 共享eval pool可能使warmup阶段额外执行validation并延后训练capture；性能窗口同时保存capture/warmup状态与validation次数。当前profiler另为Neuron加入PrivateUse1活动和with_stack，不能把该分支误当作HCU已获得新的profiler后端；HCU证据仍按现场Torch/DTK采集链确认。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/observability/profiler.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/observability/profiler.py)
 - [torchtitan/observability/METRICS.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/observability/METRICS.md)
@@ -130,3 +166,16 @@ TorchTitan 自带 MFU/峰值表面向它支持的卡型；HCU 应使用已核实
 
 - [torchtitan/distributed/accelerator_graph.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/accelerator_graph.py)
 - [torchtitan/components/optim/optim.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/components/optim/optim.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+MFU 改为基于实际原始 microbatch 的逻辑 FLOPs，取完整模型、在 DP mesh 平均而不重复 CP；不包含 causal sparsity、重算与 elementwise。未知硬件峰值时不再强行格式化为一个数，不能借相似型号补值或把统计变化当 kernel 加速。loss/validation metrics 也按当前 sum/max 与有效 token 口径归约，比较历史日志先对齐定义。
+
+首次 Optim.step 现跳过 XPU 的 sync/empty_cache；Graph wrapper 删除捕获前重复显式 empty_cache，由 capture API 自己同步/清未用缓存。Trainer.train 异常将原异常传给 close_profiler，OOM 及 PP 包装的 OOM 可生成退出内存快照；正常关闭不伪造 OOM。已读 CPU 回归设计，未执行该上游测试或设备采集。
+
+W&B 横轴使用 `trainer/step`，其 `_step` 只计 log calls；同一训练 step 的训练/validation 可以占多行。`WANDB_RESUME_FROM/FORK_FROM` 的 `_step=N` 是日志行号，不能直接填训练步号。RL 的并行 validation 还记录 `validation/started_at_step`，完成时才记日志且期间权重可变，需保留策略范围与额外生成负载。
+
+固定入口：[torchtitan/models/README.md](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/models/README.md)；[torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/training_engine.py)；[torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/trainer.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。

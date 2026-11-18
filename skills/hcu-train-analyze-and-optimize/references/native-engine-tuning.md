@@ -19,6 +19,8 @@
 
 参数被解析、设置日志出现或源码含有实现，都不证明实际生效。检查模型/shape/dtype、训练或推理阶段、硬件、并行布局、依赖版本和编译选项限制，以及自动选择、静默 fallback、被 launcher 覆盖等情况。默认已启用且命中预期路径的能力也要识别，避免把它重复当成新增优化。
 
+配置迁移后追到最终消费对象。官方 Megatron [run config](../../../knowledge/projects/megatron/knowledgebase/local/overview/engineering-guide.md) 已由分节配置接管训练和保存恢复，修改 `get_args()` 不一定改变实际模型、checkpoint 或 optimizer；wrapper/buffer 建立前完成规范化与校验，不能建好后任意改 recipe 却沿用旧存储。对现场分支仍按其配置所有者核对，不把官方开发线的迁移视作 HCU 已升级。
+
 | 候选来源 | 需要确认的状态与证据 |
 | --- | --- |
 | 当前 HCU 分支和现场配方 | 以实际部署的版本、调用者和脚本为准，查 HCU 特有优化及与官方同名参数的差异；通过 HCU-Knowledge 查证，必要时读对应源码 |
@@ -43,9 +45,17 @@
 
 参数之间可能互斥或依赖：融合后端影响图捕获与临时内存，重算影响通信可隐藏窗口，微批改变算子 shape，推理缓存影响训练可用显存。把必要组合与互斥关系先写清，再安排实验；不要独立打开全部“优化开关”后猜收益来源。
 
+源码新增硬拒绝时，先在最终 resolved 配方和自动启用链之后检查。官方 Primus `0ea805946fb45e12e49e28c7217fa194733ea5dc` 的 [参数校验](https://github.com/AMD-AGI/Primus/blob/0ea805946fb45e12e49e28c7217fa194733ea5dc/primus/backends/megatron/patches/args/rocm_arg_validation.py) 将 `deferred_cross_entropy` 与 `use_turbo_cross_entropy` 判为互斥：两者替换同一 CE 入口，patch 失败只写日志不足以保证模型按预期执行。它还拒绝名字含 `muon` 的优化器与 Turbo grouped experts 的组合；该判断要求 Turbo、Turbo grouped GEMM、MoE grouped GEMM 和专家数同时生效，因为堆叠的三维专家权重不会接受 Muon 的二维正交化，可能静默交给 scalar optimizer。关闭 Turbo grouped GEMM 时，还须下调依赖它的 sync-free MoE stage 2/3，重新核对有效配置与参数组。此为该官方提交的校验与测试设计，不代表任意 HCU 分支已包含相同门禁；不能改成 Adam 来绕过原训练配方。
+
 MoE 的专家计算检查是否经过 TE grouped GEMM，以及能否复用 hipBLASLt 的 grouped GEMM 后端。具体开关、默认行为和支持条件按实际引擎/TE/数学库版本查询 HCU-Knowledge 并核对消费者源码，不把历史环境变量当作所有版本的必设项。适用时验证实际分派、前后向数值及整步收益；已命中仍有性能缺口，再按[数学库调优](math-library-tuning.md)提取真实分组复现交接，不直接重写已有能力。
 
 若实际引擎使用 Primus Turbo、AITER、DeepGEMM 或 LightOP，则沿该消费者的公开入口、父锁和 native 分派审查，不强行改成另一 grouped GEMM。区分本地 routing/scatter/gather、专家计算与跨卡 dispatch/combine，并将 pack/scale、有效 token、容量、返回对象和异步完成协议作为整体候选。库中新增 prepared Graph、device-args 或原生融合不代表当前引擎已接入；明确普通 eager、prepared 路径及 fallback，验证变化路由、多次 backward、main_grad 和稳定地址后才尝试相关组合。实现选择和数值检查见[库联动](hcu-library-integration.md)。
+
+RL rollout 后端还须区分官方 Core、HCU Adapter、可选 Plugin 和旧 fork。当前 HCU [vLLM 0.33 插件](https://github.com/HYGON-AI/vllm-plugin-das/blob/42a31f80e93c68bf406fd4e312f8bb7192576da1/README.md) 使用 `adapter_extension`，distribution 为 `hcu-vllm-das-plugin`、import 为 `hcu_vllm_das`；旧根 `vllm_hcu` 是 0.28.1 历史参考，根 setup 拒绝旧构建方式。SGLang 的 DSV4.1 fork、main 与独立插件另有来源和 ABI；该 fork 的 [AOT 入口](https://github.com/HYGON-AI/sglang-das/blob/6b0aa9f450fffa697659193a41d0b27bdf669145/python/sglang/kernels/aot/README.md) 已移到 `python/sglang/kernels/aot`，distribution `sglang-kernel` 与 import `sgl_kernel` 不同。切换时重新核对真实内核、权重/缓存所有权与 dispatch，不能把包准入或 import 成功当作训推同步、质量和 Graph 均通过，也不因资料更新自动更换 rollout 环境。
+
+消费方的版本范围另行检查。例如官方 LLaMA-Factory `885a4ca` 的 [parser](https://github.com/hiyouga/LlamaFactory/blob/885a4ca65cebf17a92e869af13c2ce42caca314a/src/llamafactory/hparams/parser.py) 对 vLLM 的正常检查范围是 `>=0.4.3,<0.29.0`，不能与上述 HCU 0.33 插件因名称相同就拼成已兼容组合。先按实际训练框架分支、Core/adapter/plugin 与 ABI 验证整条消费链，再保留或回退候选；绕过版本检查不能充当兼容证据。
+
+数据面请求可用也不证明控制面可用。权重更新、内存 release/resume、暂停/继续及版本端点分别检查实际服务能力、独立凭据与完成状态；官方 [SGLang 权重更新](../../../knowledge/projects/sglang/knowledgebase/local/topics/weight-update.md) 当前要求独立 admin key/Bearer，普通业务 API key 不赋予这些管理能力。权限失败先按真实返回诊断，不能误判为网络问题并重放可能已执行的操作；密钥留在现有安全配置中。
 
 卷积等 MIOpen 热点还要核对 layout、Find/benchmark、workspace 与缓存是否适配当前 HCU 调用路径：按[数学库调优](math-library-tuning.md)先比较已有选优能力，再决定 size 交接。搜索预热与正式运行分开；框架开关、HCU Find 模式和 AMD 同名参数不默认等价。rocBLAS 的自动选优结果同样回到真实引擎 backend 与配置命中验证，不能把独立工具的收益直接计入整步。
 

@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: thudm-slime
   path: train.py
@@ -69,6 +70,11 @@ sources:
   path: tests/test_server_control.py
   commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: f4d802544e73352c69812900f56e16766cd1ad3173f441445857a11a45751010
+- source: thudm-slime
+  path: slime/backends/megatron_utils/arguments.py
+  commit: 79aa41a884ab0bf65222c94418f6357d3c31192b
+  sha256: 3785007fa2ecdb4a5569e95bedc91542388e3b1c47107e4f9d790b3011ef2a24
+retrieved_on: '2026-11-18'
 ---
 
 # Slime：disk delta 全量基线、版本发布与联合恢复
@@ -138,3 +144,9 @@ full发布遍历非expert/expertHFtensor，写safetensorsshards、精确bytesnap
 ## 本轮补充固定证据
 
 - [tests/test_straw_checkpoint_rewind.py](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/tests/test_straw_checkpoint_rewind.py)
+
+## Gloo 组配置的实际使用值
+
+同一训练后端的参数入口在 `79aa41a884ab0bf65222c94418f6357d3c31192b` 提供新旧 Gloo 属性兼容 helper，优先当前 `use_gloo_process_groups`，只在不存在时回退旧名。Megatron 的最终参数校验可以关闭该能力，因此协调权重元数据或检查恢复通道时应确认实际已创建的进程组与使用点值，不预先缓存旧属性或另外启动冲突的 Gloo 组。
+
+本次参数兼容不改变已固定的 delta 基线、哈希、版本、发布原子性和恢复门槛；仍须在部署的 MCore/推理后端组合中验实际完成链。

@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: hiyouga-llama-factory
   path: src/llamafactory/data/processor/supervised.py
@@ -41,6 +42,15 @@ sources:
   path: tests/model/model_utils/test_packing.py
   commit: 702005ce5237ae10f3c572c3f7741ecfd1422fc9
   sha256: 8f55134b4c16d30961d2ce06b182b44592150c113ee43b3b2b44ed1fb1760295
+- source: hiyouga-llama-factory
+  path: src/llamafactory/model/model_utils/attention.py
+  commit: 885a4ca65cebf17a92e869af13c2ce42caca314a
+  sha256: 6a96aa82ee77d72f94882f28fae39293b2e9c17468638e36d9caee4e3665071f
+- source: hiyouga-llama-factory
+  path: src/llamafactory/hparams/parser.py
+  commit: 885a4ca65cebf17a92e869af13c2ce42caca314a
+  sha256: 9828c236837588b70edbb041182d635dc6550a57b40ed01134bec965f2b9e920
+retrieved_on: '2026-11-18'
 ---
 
 # LlamaFactory SFT：packing、attention 与多模态位置契约
@@ -98,3 +108,9 @@ packing 减少 padding，FA2 varlen 还能减少 padding对应的注意力工作
 官方 [supervised processor tests](https://github.com/hiyouga/LlamaFactory/blob/702005ce5237ae10f3c572c3f7741ecfd1422fc9/tests/data/processor/test_supervised.py)、[collator tests](https://github.com/hiyouga/LlamaFactory/blob/702005ce5237ae10f3c572c3f7741ecfd1422fc9/tests/data/test_collator.py)和 [packing tests](https://github.com/hiyouga/LlamaFactory/blob/702005ce5237ae10f3c572c3f7741ecfd1422fc9/tests/model/model_utils/test_packing.py)是回归入口，本文未执行HCU测试。RoPE长度报错先对每个字段实际shape；loss异常先检查mask/分段，避免直接认定attention kernel数值错误。
 
 遇到未支持的模型/backend，退回已验未packing路径或兼容neat实现，再定位缺口；保留吞吐/内存差异，不将关闭样本隔离作为同语义优化。更新同时复核processor、collator、model attention/packing patch、模板和测试，不能只刷新README支持表。
+
+## Attention 设备门禁与消费方版本
+
+`885a4ca65cebf17a92e869af13c2ce42caca314a` 的 legacy FA2 选择增加 XPU 专用 `kernels` 检查；依赖缺失会告警返回，并不证明请求的优化 backend 已生效。HCU 继续按实际设备分支、加载路径和 attention 输出确认 dispatch。该变化不放宽原 neat-packing 的 batch/model 限制，也不改变 mask、mRoPE、labels 或 loss 目标。
+
+legacy vLLM 推理版本门禁已扩至 `<0.29.0`，与训练 attention、HCU vLLM 插件分别验证；不能因为某推理包可安装，就扩大本页 packing 数值或多模态支持范围。

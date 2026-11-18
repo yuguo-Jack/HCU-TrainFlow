@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
+reviewed_on: '2026-11-18'
 retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
@@ -60,7 +60,32 @@ sources:
   path: transformer_engine/pytorch/ops/fuser.py
   commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: db2aad0d18bc881e8887d54eb582ee646d4a487584e4d0b83ea76fdc3064adf4
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/quantization.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: d2cc28ae1002f27ea5d3cd1b2c9ceb542d5f74c335d57857a55962ace8900b52
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/module/base.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 179b03c50a372173634e598e94066fcc99a9fad248475e5e429c34c743770948
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/module/linear.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 2a0df591bfde1c3cb5eee4c55bc479f16a09657f975feff603e1e666f9c91c5b
+- source: nvidia-transformerengine
+  path: tests/pytorch/test_numerics.py
+  commit: 8e89d3ad8b2ce7adb9a8ad4bd5798197db16de8b
+  sha256: 20c3e01ed8b263c94d2eb7208fbc86c9de2ff478c720935fbfbf32618f046eaf
+- source: nvidia-transformerengine-docs
+  path: advanced-optimizations
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: c977c8d5cc732d9bb29b43914503a926f139746296f0d390a7b185b128ffe16c
+- source: nvidia-transformerengine-docs
+  path: fp8-primer
+  commit: 72dfe3c00c835bfb71c36479763bab8eeae6d77778d3365ad380723d9ea62843
+  sha256: b249549e2d4c96315a038cf6f869ece7863cacf9993b79aa9ff00c96a9662c8b
 ---
+
 # TE 低精度训练：recipe、amax、权重缓存与反向状态
 
 ## 先区分三个层次
@@ -93,6 +118,8 @@ sources:
 当前 `720b25258be3` 的 Linear 编译路径已允许 CPU `is_first_microbatch` 控制的 FP8 cache：首个 microbatch 新建并替换副本，后续复用；GPU tensor 控制的 skip-update 与 `fuse_wgrad_accumulation=True` 仍不能据此进入该 functional 路径。`reduce-overhead` 模式要求在每个 minibatch 前调用 `torch.compiler.cudagraph_mark_step_begin()`，保住该 minibatch 内各 microbatch 共用的副本；不要每个 microbatch 重设边界。
 
 recipe 本身也是缓存身份。`Recipe.__repr__` 现在包含新增的公开属性并在增删/改值时失效，OperationFuser 用 recipe 字符串和首个反向 op 边界选择计划。当前 Blackwell 及后续架构以 MXFP8 模拟 FP8 block scaling，三个量化角色均要求 power-of-2 scales；关闭该条件会被支持检查拒绝，不能仅凭 recipe 类名沿用旧缓存。
+
+当前 `8e89d3ad8b2c` 在进入 enabled autocast 时先按具体 recipe 调用 `check_recipe_support`，失败在修改量化上下文之前暴露；NVFP4 与默认 FP8 分支分别检查支持。UE5M3 还需所述目标架构、CUDA≥13.4 与 cuBLAS≥13.11，不能由普通 FP8 可用推断。DelayedScaling+torch.compile 仍明确拒绝；全局 autocast 参数和 amax 更新仅在对应 delayed 状态存在时登记/归约。这些是状态边界的变化，不改变权重缓存需要跟随参数版本和 microbatch 合同的要求。
 
 ## 主梯度 dummy 的存储与设备
 

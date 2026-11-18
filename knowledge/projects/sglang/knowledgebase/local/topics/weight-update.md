@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: reviewed implementation chains and official guides; not all models, backends or HCU runtime qualification
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: sgl-project-sglang
   path: docs/docs/advanced_features/sglang_for_rl.mdx
@@ -81,9 +82,46 @@ sources:
   path: python/sglang/srt/mem_cache/kv_weight_version_tracker.py
   commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
   sha256: 43688f519119233fe8c3f56d4ff658a70340fb3145a45e4b8f73c109791add05
+- source: sgl-project-sglang
+  path: docs/docs/advanced_features/sglang_for_rl.mdx
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 913fc4f4726b9ff0160fe66e2d3bd06fca561c780ddc378c0b29d80fac16c05a
+- source: sgl-project-sglang
+  path: python/sglang/srt/entrypoints/http_server.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 4f12b6f21438c4493a122fc940c14ba275f11e9778bf211731c6a623327e88b9
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 523c96a107548ce1b3871b5fe8191faa797085225030acbb9e3839ff4cac4fcd
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth_levels.json
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: ecb5585cdf47c833231e44daf0355ef20ea7ab2583d171f95569359a99623ce1
+- source: sgl-project-sglang
+  path: python/sglang/srt/managers/io_struct.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 38202705bcea2148f5688e5cc83b59495ace6a880cdc2b5c80ebb58b111b4cde
+- source: sgl-project-sglang
+  path: python/sglang/srt/managers/scheduler_components/weight_updater.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 964e30afb6782e2acdd04579b063f1da73e82081240b97645d84cf42b3cadbea
+- source: sgl-project-sglang
+  path: python/sglang/srt/managers/tokenizer_control_mixin.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 8a0f84925b61487add6ba8332e290992dea017c3c084aeeb2d00d1f8cb8c861e
+- source: sgl-project-sglang
+  path: python/sglang/srt/model_executor/model_runner_components/weight_updater.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: dedf33271c191379c188dfe1e1642793c1abeb38c9abe9241a979b023bd0140b
+- source: sgl-project-sglang
+  path: test/registered/unit/model_executor/test_weight_update_tensor_rank.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: e20f03d0ff5b383af1e0cf0ae2e3319efd4cef5f5468171f537ce35bcfe11ae5
 pr_sources:
 - pr-sgl-project--sglang-42561
 - pr-sgl-project--sglang-43758
+retrieved_on: '2026-11-18'
 ---
 
 # SGLang 权重同步：会话、混合 dtype 与缓存一致性
@@ -184,3 +222,11 @@ metadata验证应覆盖名字唯一性、shape/dtype、字节范围/对齐和完
 
 
 本页在 2026-11-04 复核上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+
+## Admin 准入、rank 一致性与平台传输
+
+`78b8523f77ea6b930d065c9dd128a97b222a35c9` 的 begin/end、update_weights、plugin传权、update group和版本接口要求独立admin key及Bearer；未配置为403、缺少/错误Bearer为401。普通生成API凭据或health200均不证明有控制权限。先固定服务端实际版本和客户端headers，再把鉴权、业务拒绝、传输与部分加载分别诊断。
+
+平台 `plugin_weight_update` 要求已有session与已注册handler；收到tensor时复用选定runner的loader，然后通过CPU TP组汇总每rank错误。目标/草稿selector应与begin所建立的会话一致；此入口按请求selector加载，end按session记录selector收尾，不能混选后仅依靠end成功推断所有runner已终结。部分rank失败时，其它rank可能已写当前bucket；应按可信完整版本重做整轮或退役engine，不承诺自动回滚。`received_tensor_counts` 是每rank返回列表长度，loader可能跳未知名字，不能以数量代替名称、shape、dtype与完整覆盖检查。
+
+普通distributed路径先检查三份metadata等长并准备全部buffer，全部成功后才投递async broadcast并等待handle；相应固定测试覆盖后项dtype/shape/分配失败不会遗留先前接收。`load_format="direct"` 新增模型声明的派生权重限制，因为它跳过模型load/post-load hooks；不能因普通loader可用就启用direct。begin/end、disk、IPC、tensor与plugin路径还用schedule stream等待已launch forward，避免in-place pause后仍有读权重的旧工作。这里的源码/测试均未在设备上运行。

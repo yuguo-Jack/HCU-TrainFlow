@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: reviewed implementation chains and official guides; not all models, backends or HCU runtime qualification
+reviewed_on: '2026-11-18'
+coverage: Selected fixed-source changes and affected consumers; no upstream/HCU runtime
+  execution
 sources:
 - source: sgl-project-sglang
   path: README.md
@@ -77,9 +78,38 @@ sources:
   path: python/sglang/srt/mem_cache/kv_weight_version_tracker.py
   commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
   sha256: 43688f519119233fe8c3f56d4ff658a70340fb3145a45e4b8f73c109791add05
+- source: sgl-project-sglang
+  path: docs/docs/advanced_features/sglang_for_rl.mdx
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 913fc4f4726b9ff0160fe66e2d3bd06fca561c780ddc378c0b29d80fac16c05a
+- source: sgl-project-sglang
+  path: python/sglang/srt/entrypoints/http_server.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 4f12b6f21438c4493a122fc940c14ba275f11e9778bf211731c6a623327e88b9
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 523c96a107548ce1b3871b5fe8191faa797085225030acbb9e3839ff4cac4fcd
+- source: sgl-project-sglang
+  path: python/sglang/srt/utils/auth_levels.json
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: ecb5585cdf47c833231e44daf0355ef20ea7ab2583d171f95569359a99623ce1
+- source: sgl-project-sglang
+  path: python/sglang/srt/managers/scheduler_components/weight_updater.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 964e30afb6782e2acdd04579b063f1da73e82081240b97645d84cf42b3cadbea
+- source: sgl-project-sglang
+  path: python/sglang/srt/managers/tokenizer_control_mixin.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: 8a0f84925b61487add6ba8332e290992dea017c3c084aeeb2d00d1f8cb8c861e
+- source: sgl-project-sglang
+  path: python/sglang/srt/model_executor/model_runner_components/weight_updater.py
+  commit: 78b8523f77ea6b930d065c9dd128a97b222a35c9
+  sha256: dedf33271c191379c188dfe1e1642793c1abeb38c9abe9241a979b023bd0140b
 pr_sources:
 - pr-sgl-project--sglang-42561
 - pr-sgl-project--sglang-43758
+retrieved_on: '2026-11-18'
 ---
 
 # SGLang：RL 生成依赖的工程、运行与维护地图
@@ -185,3 +215,11 @@ profile 分开排队、tokenization/CPU 调度、prefill、decode、传权和 sl
 
 
 本页在 2026-11-04 复核上述固定源码、教程及最近 10 条 release 元数据；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+
+## 当前控制面、插件传权与实际完成
+
+固定 `78b8523f77ea6b930d065c9dd128a97b222a35c9` 的 RL 权重、pause/continue 和显存释放/恢复接口属于强制 admin 面。HTTP server 使用统一 auth middleware，`auth_levels.json` 将这些实际路由列为 `admin_force`：未配置独立 admin key 返回403，未提供或错误 Bearer 返回401，普通 API key 不能解锁。健康/就绪检查可以免鉴权，health成功不证明控制面可用。消费者需核对实际版本和凭据接线，不能把拒绝当网络超时后盲重放；HCU部署是否已采用该接口另行确认。
+
+新增 `plugin_weight_update` 在已开启的 begin/end session 内调用平台登记 handler，传入每TP rank上下文与持久transport state；DP replicas仍被拒绝。调用前检查各runner的daemon/派生权重限制并等待已launch forward；handler/load错误再跨TP汇总，全部成功才推进所请求版本/缓存动作。返回的每rank tensor数量只是接收列表长度，未知名字可能被loader跳过，不是完整参数更新证明。失败可能已有其它rank写入，不能当作原子回滚。
+
+普通distributed接收现在先验证names/dtypes/shapes等长、分配全部buffer，再投递broadcast，避免zip截断或后段分配失败留下前段collective。`direct`写入另检查跳过load/post-load会造成派生buffer陈旧的模型限制。实际完成仍须核对目标/草稿runner、会话selector、参数与版本、end/post-load及新策略logits，而非只看RPC状态。官方RL文档当前使用 `sgl-router` 路由入口，现有HCU/消费者部署独立锁定。

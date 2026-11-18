@@ -8,8 +8,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU
+  runtime validation
 sources:
 - source: amd-agi-primus
   path: primus/backends/megatron/patches/recompute_layer_patches.py
@@ -35,7 +36,15 @@ sources:
   path: primus/backends/megatron/patches/_source_patch_utils.py
   commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: b8d4d892ee84b7c24577cc47ddfba6cbea0f571eeafd9d2916b41affa1b548cb
-retrieved_on: '2026-11-04'
+- source: amd-agi-primus
+  path: primus/backends/megatron/core/models/diffusion/common/config.py
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: 5d8fdf803dbdad9bfb0f6c21bbfe879c5e6ec2c33c8e4926b086dae552df05e0
+- source: amd-agi-primus
+  path: primus/backends/megatron/core/models/diffusion/flux/config.py
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: af87aa7758b9af3ad6b540c970c9fe20d6fec1b9da727e03b8c265cdf9ad17f8
+retrieved_on: '2026-11-18'
 ---
 
 # Primus：按全局层选择重算、MTP 与低精度状态
@@ -61,6 +70,12 @@ MTP 有独立 wrapper，索引接在 decoder 层之后；Pipeline/VPP rank 的 l
 代价是额外计算、checkpoint launch 和可能减少 overlap 的可重叠窗口。内存已够、关键路径纯计算时更少重算可能更快；OOM 风险高时不能只按速度选择。层数/输入长短变化后旧选择不一定仍覆盖峰值。
 
 先区分激活峰值与 allocator 碎片：当前 Turbo grouped GEMM 的大块主梯度/状态分配可能增加 reserved，新增 allocator 告警/预检并不等于必须多重算。核对 allocated/reserved、真实生效设置与 [总览中的预检边界](../overview/engineering-guide.md#8-数值诊断与恢复)，再决定重算、布局或 allocator 候选；不将几种机制的显存节省简单相加。
+
+## Diffusion 的敏感层与低精度重算边界
+
+官方 `0ea805946fb45e12e49e28c7217fa194733ea5dc` 新增的 [Flux 配置校验](https://github.com/AMD-AGI/Primus/blob/0ea805946fb45e12e49e28c7217fa194733ea5dc/primus/backends/megatron/core/models/diffusion/flux/config.py) 说明不能从文本 Transformer 的选层机制推导所有 diffusion 组合安全。`transformer_impl='transformer_engine'` 只能将 sensitive layers 保持 BF16；请求其他 sensitive 精度会拒绝。需要 per-layer 量化 context 时，编译策略仅接受 `per_block` 或 `whole_model`，stack/full-DiT 直调会绕过这些 context；FP4 与 full activation recompute 也被拒绝，因为重算起点的 autocast/列向权重准备不满足 backward 所需条件。local 路线不经过这项 TE 专属校验，但仍须验证其实际实现，不能把“未拒绝”当正确性通过。
+
+同一提交的 diffusion common config 新增 `mxfp4_forward_precision`（默认 mxfp4，可选 BF16 forward），与 backward precision 分开。候选需同时记录前后向精度、敏感层、编译路径和重算范围，先做对应状态/输出/梯度回归，再测显存与吞吐；不能靠移除硬门禁保留一个未受支持组合。本次仅阅读配置及拒绝逻辑，未运行 Flux/TE 或声称组合收益。
 
 ## 诊断、回退与维护
 

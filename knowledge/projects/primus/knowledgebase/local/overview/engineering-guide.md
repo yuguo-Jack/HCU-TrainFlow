@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU
+  runtime validation
 sources:
 - source: amd-agi-primus
   path: README.md
@@ -77,7 +78,43 @@ sources:
   path: tests/unit_tests/backends/megatron/test_rocm_arg_validation.py
   commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: e3f0d1747f0bcfc4ff8225214d94e59c0700abbf43c956f3117556d3e7341f19
-retrieved_on: '2026-11-04'
+- source: amd-agi-primus
+  path: README.md
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: e11c0e5897acbd1590e84e13e9f86848ee2dbd19b5ba946d8a34b9cb0226de66
+- source: amd-agi-primus
+  path: .gitmodules
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: c1fcaba871ac48977fba32db9f6de4d14240295b410aca8c091262e039d6844a
+- source: amd-agi-primus
+  path: docs/01-getting-started/release-notes.md
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: b1b78087235ded148f7561cd5e3edafffb5d1cf3bcd4cc838478dbaa55cbed42
+- source: amd-agi-primus
+  path: docs/02-user-guide/megatron-lm-training.md
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: d8b9c0956411ba08c1895f04598d2d5b61bb718fbbcc19684fab32cacf75b9a1
+- source: amd-agi-primus
+  path: primus/backends/megatron/patches/args/rocm_arg_validation.py
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: 9b61020d47edd7cae4fdd82ad60831ed85b66b120c5c8e1208a4dbd78a83fe52
+- source: amd-agi-primus
+  path: tests/unit_tests/backends/megatron/test_rocm_arg_validation.py
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: 1f0743d28f9d75897ef2d4d928254743d7e3b16937e878cde809864526fb289b
+- source: amd-agi-primus
+  path: primus/backends/megatron/core/models/diffusion/common/config.py
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: 5d8fdf803dbdad9bfb0f6c21bbfe879c5e6ec2c33c8e4926b086dae552df05e0
+- source: amd-agi-primus
+  path: primus/backends/megatron/core/models/diffusion/flux/config.py
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: af87aa7758b9af3ad6b540c970c9fe20d6fec1b9da727e03b8c265cdf9ad17f8
+- source: amd-agi-primus
+  path: primus/backends/megatron/core/models/kimi_k3/kimi_k3_transformer_config.py
+  commit: 0ea805946fb45e12e49e28c7217fa194733ea5dc
+  sha256: e42f8ef1648706db7dccdcccb9de7f70a65cedca77eab26a6e82e0a4bf45140e
+retrieved_on: '2026-11-18'
 ---
 
 # AMD Primus：配置、后端补丁、并行与恢复
@@ -106,17 +143,19 @@ Primus 为多个训练后端提供统一配置、启动、补丁、测试及性�
 
 `pyproject.toml` 要求 Python >=3.10，提供两个入口：`primus-cli` 是统一 Bash runner，`primus` 是 Python 命令。先按官方 bare-metal 或容器安装指南确认实际 Torch/ROCm/TE/Primus-Turbo，再安装父仓与后端；仅装 Python 壳不能证明后端扩展可用。递归 clone 或 submodule update 应保留父提交及 gitlink，避免“父仓固定、子仓浮动”。
 
-本页于 2026-11-04 检索并核对父仓 `bab82720d72cadbdfbedcc050c9fb49de3b353be` 的完整树及以下 gitlink。相对上轮，Core 与 MaxText 已推进，Bridge、TorchTitan 和 HunyuanWorld-Mirror 未变；父仓改动与各后端版本分别判断：
+2026-11-18 核对父仓 `0ea805946fb45e12e49e28c7217fa194733ea5dc` 的完整树及以下 gitlink，见[固定父树证据](../../../../../catalog/parent-links-20261118.json)。相对 2026-11-04 的 `bab82720`，下表仅 MaxText 推进，其他四项未变；父仓改动与各后端版本分别判断：
 
 | gitlink | 实际固定提交 |
 | --- | --- |
 | `third_party/Megatron-LM` | `4b4acac9a1d28ea6829c8d4f566d75698a21249d` |
 | `third_party/Megatron-Bridge` | `9577b1280eaadd60b9d7b0ce6df09ac80e87e323` |
 | `third_party/torchtitan` | `73a0e6979dd10b6b1904098eb3c8f62c18ab87ce` |
-| `third_party/maxtext` | `8d1d43c039297a449c4e2af012e6adbed1c4ef04`，URL 为 ROCm/maxtext |
+| `third_party/maxtext` | `2fb48f50e8614650639802ec304e2195c27d7598`，URL 为 ROCm/maxtext |
 | `third_party/HunyuanWorld-Mirror-rocm` | `c61300e47ce06db2f02c8e2551aae68be7ae3a0b`，URL 为 Tencent-Hunyuan/HunyuanWorld-Mirror；本页只核对依赖身份，未审计完整训练实现 |
 
-README 新增 `26.2.0rc1` wheel / 源码安装路线：wheel 提供 CLI，不包含全部重型后端；`primus-cli deps sync --dir ...` 拉取固定后端及递归子模块，首次使用仍可能下载，不能据此承诺离线。官方使用指南推荐 `rocm/primus:v26.8` 配合 `release/v26.8`，这是发布配对；本页精读 main 与该发布分支不同。发布说明还区分 `rocm/primus` 的 ROCm 10.1 / PyTorch 2.14 与 `rocm/primus-maxtext` 的 ROCm 10.2 nightly / JAX 0.11.1；同为 v26.8 不表示软件栈同步，MaxText 镜像需挂载对应 Primus 分支。这里记录的是官方配对说明，没有验证这些镜像或其 HCU 适用性。指南还说明容器实际使用挂载的 host checkout，不能把镜像内烘焙代码版本当成正在执行版本。HCU 用现场镜像/DTK 的配套工程，核对 `import` 路径、git revision、共享库和 backend 日志。
+当前 `0ea805946fb45e12e49e28c7217fa194733ea5dc` 的 README 将 wheel/tag 入口改为 `26.9.0`，指南推荐 `rocm/primus:v26.9` 配合 `release/v26.9`；wheel 仍提供 CLI 而不包含全部重型后端，`primus-cli deps sync --dir ...` 首次使用可能下载，不能承诺离线。发布说明区分 PyTorch 镜像的 2.16 pre-release / ROCm 10.2 nightly，与 `rocm/jax-training:maxtext-v26.9` 的 JAX 0.12.0 / ROCm 10.3 nightly；同一 v26.9 标签不表示栈一致，安装时核对容器实际元数据与依赖。上述是官方发布配对，本页精读 main 不是该 release 的自动替身，也未验证镜像或 HCU 适用性。容器可实际执行挂载的 host checkout，仍要核对 `import` 路径、git revision、共享库和 backend 日志，不能只读镜像内烘焙版本。旧 v26.8 的发布配对及数据继续只适用于原记录。
+
+新父仓 `.gitmodules` 将 MaxText 的 branch hint 改为 `release/v26.10`；该 hint 与上表实际 gitlink 分别记录，不能让子仓跟随分支 HEAD。独立 Megatron-LM main 的新机制也不自动进入父仓仍锁定的 `4b4acac9`。
 
 ## 4. 配置、运行与测试
 
@@ -142,6 +181,8 @@ README 新增 `26.2.0rc1` wheel / 源码安装路线：wheel 提供 CLI，不包
 
 一个容易忽略的行为：通用 `run_patches` 默认记录导入/执行异常，只有 `stop_on_error` 才传播；本轮 runtime `_run_phase_patches` 没有传这个选项。因此“某 patch 函数会 raise”不能证明整次训练会失败。采用性能特性时应检查成功日志、被替换函数与 trace；避免补丁失败后普通路径继续训练却被记作优化已生效。
 
+当前源码为此增加了独立的入口校验，而不是只依赖 patch 抛错：`deferred_cross_entropy` 和 `use_turbo_cross_entropy` 替换同一 TE CE 符号，二者同时生效会在参数校验中硬拒绝。新增 Muon 检查在 optimizer 名字含 `muon`，且 Turbo、Turbo grouped GEMM、MoE grouped GEMM、专家数全部有效时拒绝运行；堆叠的三维专家权重不满足二维 Muon 正交化，可能静默交给 scalar optimizer，不能将其视为原优化器等价。回退需关闭 Turbo grouped GEMM，并在 sync-free MoE stage≥2 时同时下调 stage；随后复查最终参数组、dispatch、数值和性能，不能把换成 Adam 当作修复原配方。固定校验与对应单测见 [rocm_arg_validation.py](https://github.com/AMD-AGI/Primus/blob/0ea805946fb45e12e49e28c7217fa194733ea5dc/primus/backends/megatron/patches/args/rocm_arg_validation.py)；测试定义已读，未在此执行上游训练。
+
 ## 7. 两类重点性能机制
 
 - [编译与 DDP/TP overlap](../topics/primus-compile-overlap.md)：为什么参数 gather hook 要避开编译区域，TE1/TE2 路径如何选择，如何验证同步仍正确；关联 [已有案例](../cases/primus-compile-ddp.md)。
@@ -161,7 +202,7 @@ Turbo grouped GEMM 将一层专家堆成较大参数，optimizer 主梯度/状�
 
 ## 9. PR、发布与后续更新
 
-官方发布说明、[Releases](https://github.com/AMD-AGI/Primus/releases)、[PR 列表](https://github.com/AMD-AGI/Primus/pulls) 是持续变化入口；不能把 main 某项实现直接列成 v26.8 已发布。当前值得联查的固定 PR：[#1237 保留 HIP_VISIBLE_DEVICES](../../upstream/prs/AMD-AGI--Primus/PR-1237.md) 防止 runner 重置共享设备选择；[#1240 router backward BF16](../../upstream/prs/AMD-AGI--Primus/PR-1240.md) 是默认关闭且保留精度 fallback 的局部机制，需读其 Core/TE 依赖和测试。
+官方发布说明、[Releases](https://github.com/AMD-AGI/Primus/releases)、[PR 列表](https://github.com/AMD-AGI/Primus/pulls) 是持续变化入口；main 的某项实现是否进入发布须按目标 tag 核实。当前 README/release notes 已给 v26.9 配对，不把新 main 的门禁自动宣称为所有旧 release 已回移。值得联查的固定 PR：[#1237 保留 HIP_VISIBLE_DEVICES](../../upstream/prs/AMD-AGI--Primus/PR-1237.md) 防止 runner 重置共享设备选择；[#1240 router backward BF16](../../upstream/prs/AMD-AGI--Primus/PR-1240.md) 是默认关闭且保留精度 fallback 的局部机制，需读其 Core/TE 依赖和测试。
 
 新增的 [SpecForge 指南](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/04-technical-guides/specforge/introduction.md) 和 [ZAYA1 验证记录](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/04-technical-guides/zaya1/validation.md)分别提供后端路线和特定配方证据。后者记录的是 MI300X、GSM8K 短序列训练及另一个已发布权重的 forward 对照；MI355X 配方内容相同不代表该设备已跑，更不代表 HCU 训练/收敛通过。mock 词表变化见 [#1249](../../upstream/prs/AMD-AGI--Primus/PR-1249.md)，其多项配方调整的性能不能归为单独源码改动。
 
@@ -170,6 +211,8 @@ Turbo grouped GEMM 将一层专家堆成较大参数，optimizer 主梯度/状�
 2026-11-04 的保留依据：`PrimusRuntime._run_phase_patches`、`run_patches`、配置继承和 ROCm 参数校验所引文件与上轮字节相同，故保留补丁异常默认记录、配置覆盖顺序和 allocator 告警的既有边界。parser 新增 backend alias 规范化和隐藏 `--backend`（阻止 argparse 将其缩写为 `--backend_path`），不代表仅传该字段就切换 trainer；继续以解析后的 module/framework 与启动器检查为准。重算 patch 已增加 Core 模块级函数路径，见对应专题；编译补丁自身未变也不能替代新 Core 的组合验证。
 
 2026-11-04 的固定 GitHub 最近10条 release 观测包含 [`v26.8.0`](https://github.com/AMD-AGI/Primus/releases/tag/v26.8.0)（2026-10-12）；本页 main 的新补丁/CLI 不据此自动归入该发行版。没有遍历全部发行历史，仍沿目标 tag 与消费者 gitlink 核对。
+
+2026-11-18 对 `0ea805946fb45e12e49e28c7217fa194733ea5dc` 的有界登记路径复核新增 v26.9 文档和上述 CE/Muon 门禁。diffusion 配置还新增 local MXFP4 的前向精度字段，以及 Flux 的 TE sensitive-layer/编译策略/full-recompute 拒绝条件，见[重算专题](../topics/primus-recompute-memory.md)。Kimi mixer 的配置注释新增 `eager_bcast` 及架构说明，不能仅从注释变更推断全部 native 实现或 HCU 已可用。GLM-5.3-Flash 等发布数字仍是来源设备/代理结构的验证报告，不能当全模型或 HCU 通过。未运行镜像、上游单测、设备性能或 loss 实验。
 
 ## 固定证据与复核范围
 

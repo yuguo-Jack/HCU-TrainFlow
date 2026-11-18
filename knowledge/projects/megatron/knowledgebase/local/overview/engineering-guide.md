@@ -10,8 +10,9 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
+reviewed_on: '2026-11-18'
+coverage: selected current source and consumer delta; historical pins retained; no
+  upstream or HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: pretrain_gpt.py
@@ -73,10 +74,56 @@ sources:
   path: megatron/core/optimizer/optimizer_config.py
   commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: f83b46a8a901bb7c792076544e2fefda3b76830ef2d971ecb976f0ac557fbc67
+- source: nvidia-megatron-lm
+  path: pretrain_gpt.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 1ba21dabb7284799ec1e7b2e37475e4037f8940452d6d40615d5eeba049c9a40
+- source: nvidia-megatron-lm
+  path: megatron/training/config/container.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 6fee251020eb4fa1087ea88bdd022b250e2a276910c3f217de8eb49129efd323
+- source: nvidia-megatron-lm
+  path: megatron/core/distributed/distributed_data_parallel.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 03fcdd20914b67df6076717e85230fe4eee193e5052acf999151b273e6352fa8
+- source: nvidia-megatron-lm
+  path: megatron/core/distributed/distributed_data_parallel_config.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: baa82944e137aa7b571898453348d8f57087a88b85436cca299abfe387101df9
+- source: nvidia-megatron-lm
+  path: megatron/core/extensions/te_cuda_graphs.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 3f1b8d0a46a071bea2bec94a2017d25db0d8ad12da6d5fa92afa79c85029a036
+- source: nvidia-megatron-lm
+  path: megatron/core/pipeline_parallel/fine_grained_activation_offload.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: c485208fe6b6989b6cd89e0d0f2614a061f7b5816ad5f7dd8b31d73319b856b6
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/multi_token_prediction.py
+  commit: 91260b59e815f0be44d625d75ba22cb8473e5981
+  sha256: 7fcf8b2dd9f1f42a7a64e947758dc83ebd22f0b9a06e044cef4d29b8e026de78
 retrieved_on: '2026-11-04'
 ---
 
 # Megatron LM/Core：从训练入口到并行、MoE 与内存的工程地图
+
+## 2026-11-18：本次影响现有用法的变化
+
+本节按官方固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的已读实现与消费者解释变化；后文 `21334a44` / 2026-11-04 记录保留原适用版本，不作为新部署通过证明。
+
+固定 `91260b59e815f0be44d625d75ba22cb8473e5981` 的重要变化不是统一增加一组通用启动参数：run config 的 owning section 进一步接管实际训练/保存恢复，DDP 在 wrapper 建立前 finalize 及校验，动态 CP 按 packed microbatch 选择实际 group，MTP 的训练归一化与日志计数需要分别解释。读取最终配置、真实成员/有效 token 和实际 backend 后，才比较不同版本的性能或 loss。
+
+图执行/offload 的 TE 专用 owner 移到 `extensions/te_cuda_graphs.py`；细粒度 reload 先在消费者 stream 分配缓冲，再在 H2D stream 复制并以 event 建依赖。官方 development 的这些实现及 NVIDIA 依赖不自动进入当前 HCU 稳定线。现有两篇案例仍保留原始改因和固定测试范围；重大新边界优先完善[并行](../topics/parallelism.md)、[显存](../topics/memory.md)、[checkpoint](../topics/checkpoint.md)及[训练 loss](../topics/training-and-loss.md)，不因每次源码变化重复写案例。
+
+### 本节固定证据
+
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/pretrain_gpt.py)
+- [megatron/training/config/container.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/training/config/container.py)
+- [megatron/core/distributed/distributed_data_parallel.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/distributed/distributed_data_parallel.py)
+- [megatron/core/distributed/distributed_data_parallel_config.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/distributed/distributed_data_parallel_config.py)
+- [megatron/core/extensions/te_cuda_graphs.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/extensions/te_cuda_graphs.py)
+- [megatron/core/pipeline_parallel/fine_grained_activation_offload.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/pipeline_parallel/fine_grained_activation_offload.py)
+- [megatron/core/transformer/multi_token_prediction.py](https://github.com/NVIDIA/Megatron-LM/blob/91260b59e815f0be44d625d75ba22cb8473e5981/megatron/core/transformer/multi_token_prediction.py)
 
 ## LM、Core 与生态边界
 

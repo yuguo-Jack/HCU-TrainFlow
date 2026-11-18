@@ -9,10 +9,10 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-11-04'
-retrieved_on: '2026-11-04'
-coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
-  or HCU runtime validated.
+reviewed_on: '2026-11-18'
+retrieved_on: '2026-11-18'
+coverage: Curated source chains and official evidence at a fixed main commit; not
+  all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/components/checkpointer/README.md
@@ -46,6 +46,30 @@ sources:
   path: torchtitan/models/base/module.py
   commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 68d6ed42a6b0b95baba44774bb119123ffbe7c63217248b60e5a479ab4ed7e5f
+- source: pytorch-torchtitan
+  path: torchtitan/components/checkpointer/base.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 7535af216c3ef95b5dc6c271ad85de68e0355e345e16f8321a8fe218bcb11bba
+- source: pytorch-torchtitan
+  path: torchtitan/components/checkpointer/dcp.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: f214cbeee930b80373ac3939af621ed7e499fbc1ea8a21d996fcd77b9f412ada
+- source: pytorch-torchtitan
+  path: torchtitan/components/checkpointer/torch_checkpointing.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: c569106baa8c57fee94c01770efebde209089a79e4ce19c7f4b3c8b95bb1c935
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator/model.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: d0cd8f39610905786265c3b8926e33f23285533d9b1e1dc5013d411e78c7d7df
+- source: pytorch-torchtitan
+  path: torchtitan/rl/trainer/trainer.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 4204515230aac8cee7d9cc836b3709b4b66ca461335f72d21146c17cd1cc9ffb
+- source: pytorch-torchtitan
+  path: torchtitan/rl/model_state_dict_transport.py
+  commit: 361ae5df6280e578614026b206d801d6ea1baf98
+  sha256: 13f48f0ed2b0a6b422000979b5463895c5e474f621932e5ffe24cf9eef9f5592
 ---
 # TorchTitan Checkpoint、恢复语义与长稳训练
 
@@ -99,7 +123,7 @@ TorchFT新教程要求超时形成恢复层次：inter-replica故障探测先于
 
 ## 固定证据与使用边界
 
-本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页保留官方 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 的固定历史证据；2026-11-18 新实现按 `361ae5df6280e578614026b206d801d6ea1baf98` 逐项复核，见本页增量。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/components/checkpointer/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/components/checkpointer/README.md)
 - [torchtitan/components/checkpointer/base.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/components/checkpointer/base.py)
@@ -113,3 +137,16 @@ TorchFT新教程要求超时形成恢复层次：inter-replica故障探测先于
 
 当前 EMA 改为直接在 pinned CPU 存储建立状态，避免先克隆一份 GPU 参数再搬到 CPU；恢复时还要匹配当次 DTensor 分布。详见 [并行与显存](parallelism-and-memory.md)。评估需同时覆盖初始化、稳态和 checkpoint/load 峰值，不能只拿优化后的 step 显存证明可恢复。
 - [torchtitan/models/base/module.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/base/module.py)
+
+
+## 2026-11-18 固定主线复核
+
+按 `361ae5df6280e578614026b206d801d6ea1baf98` 的实际消费者和来源测试设计复核：
+
+DCP async DefaultStager 使用独立 stream；当前在保存发起前显式让 staging stream 等当前 optimizer stream，避免复制发生在参数/moments 写完之前。它与 staging完成后允许修改原状态、saving完成后可恢复/退出是不同依赖，三个方向都要核对。
+
+DCP 和 torch_checkpointing 都调用共同 HF-export 校验：`last_save_in_hf=True` 且存在任意 frozen parameter 时拒绝，包括 LoRA。当前 adapter 不映射 LoRA adapter，继续导出会丢掉它们；不能以“已有HF文件”宣称完整模型已交付。保留 native 完整恢复点，另选明确支持的导出/转换并验证真实 key 与下一步结果。
+
+RL 权重同步仅发送 trainable parameters 与 buffers，冻结 base 必须由 `generator.checkpointer` 从匹配初始 checkpoint 加载，缺少时硬拒。LoRA base、adapter、buffers 与训练 optimizer/数据状态仍是不同来源；同步后能生成不等于完整恢复。新 transport read 超时仍可能有在途写，来源要求重启任务，不能就地复用未定义 prefetch buffer。具体入口见[RL](titanrl.md)。
+
+固定入口：[torchtitan/components/checkpointer/base.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/components/checkpointer/base.py)；[torchtitan/components/checkpointer/dcp.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/components/checkpointer/dcp.py)；[torchtitan/components/checkpointer/torch_checkpointing.py](https://github.com/pytorch/torchtitan/blob/361ae5df6280e578614026b206d801d6ea1baf98/torchtitan/components/checkpointer/torch_checkpointing.py)。本次未安装或运行上游测试/训练，没有 HCU 设备实测结论。
