@@ -13,7 +13,7 @@
 - `docs/collaboration.md`：统一入口、候选复核、人的文件指导与断点接续。
 - `docs/quickstart.md`：安装、任务、证据及 CLI。
 - `docs/workflows.md`：三个工作流与验证门槛。
-- `docs/environment-discovery.md`：发现镜像/宿主工具、复用容错检查、区分工具误判与硬件问题、建立可比性能预期；第 6 节要求对可信差距继续基本排查和有界尝试。
+- `docs/environment-discovery.md`：先主动查询 HCU 大知识库选择适用镜像、核对配套并盘点非 Python 工具，再发现现场、复用容错检查和建立可比性能预期；第 6 节要求对可信差距继续基本排查和有界尝试。
 - `docs/source-transfer.md`：Windows/Linux 源码、执行位与仓内链接的固定内容传输。
 - `docs/workspace-maintenance.md`：容量预检、缓存/临时产物登记退役、阶段低频维护和 context 独立观察 Store。
 - `docs/training-observation.md`：真实训练日志、进程身份和退出回执；启动阶段与真实进展分开。
@@ -26,6 +26,8 @@
 不要从安装目录的父级猜仓库位置；先核对上述工程绑定。执行前检查 `hcu-trainflow --help` 和相关子命令帮助，不猜不存在的 flag。
 
 ## 启动配方选择与核对
+
+先完成项目 [镜像与工具准备](../../../docs/environment-discovery.md#镜像与工具准备)，将选定运行环境、工具路径和激活链作为本节输入。脚本要求的引擎/库与镜像冲突时，返回核对配套，修订采用依据并重验受影响项。仅环境检查也执行准备与盘点，按检查目标选择所需工具。
 
 先确认现场的镜像/Conda、调度资源、启动入口和用户 patch，再寻找适用的 HCU 平台配方；稳定线优先匹配已验发布配方，快速线保持指定 commit 的模型/训练定义，只移植兼容的平台、库和 launcher 配置，不能因复用旧 HCU 脚本而换掉模型逻辑。这套规则适用于预训练、SFT 和 RL；RL 还要分别核对训练、rollout 推理及权重同步的启动链。
 

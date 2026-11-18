@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.5 — 2026-11-18
+
+- Query HCU-Knowledge for suitable image sources, version compatibility and non-Python tools before environment testing or model adaptation. Reuse applicable records and verify current source guidance, actual image identity, activation and required tool capabilities.
+- Connect preparation results to the existing environment evidence and launch recipe through the coordinator, standalone check/adapt Skill, reading routes and workflow diagram. Keep concrete image tags and tool commands in their maintained sources and task records.
+- Synchronize the selected local installation after documentation and software checks. Image acquisition and target-environment qualification remain task-specific.
+
 ## 0.8.4 — 2026-11-18
 
 - Keep an operation unresolved when the child has started but process-receipt, wait or termination control fails. Preserve reconciliation clues and resource/inbox fences; a controller error cannot authorize a duplicate launch.

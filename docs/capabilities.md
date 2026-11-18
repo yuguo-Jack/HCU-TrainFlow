@@ -25,6 +25,8 @@
 
 工作空间约束见[统一写入边界](workspace-boundaries.md)：六个 Skill 共用映射、输出/缓存和必要例外规则；源码传输另有目标链接预检，维护脚本保留受限删除检查。CLI 不为任意命令提供文件系统沙箱，部署仍须核对实际挂载、权限与工具输出。
 
+镜像选择与非 Python 工具盘点由 Agent 按[环境准备方法](environment-discovery.md#镜像与工具准备)主动查 HCU 大知识库，再核对目标现场。该方法已接入主控和独立环境/适配入口；具体镜像、工具及权限的可用性仍按目标环境验证。
+
 ## TraceLens 已验证范围
 
 当前主线另完成了 gfx936/DTK 26.10 的 TraceLens 有界资格验证：训练 Graph 前后向映射、实际输入 EventReplay、实测参考 Roofline、原生 Agent 指标及推理复核、hipprof JSON/pftrace 同源对照、XProf/XCompute counter 与 SQTT。另以真实 trace 验证了受管 split/merge/compare 和原生源码定位、索引，合并不自动校时，自比较不代表提速。命令、计时/数据边界和未覆盖项见 [TraceLens HCU 分析](tracelens-analysis.md)；没有因此扩大完整模型 loss、多架构或生产长稳的验证声明。

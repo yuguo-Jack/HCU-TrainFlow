@@ -478,3 +478,8 @@ Merged published HCU 30f5dcd then upstream 493f750 in development checkout, merg
 ## 2026-10-20 独立阶段二开始
 
 HCU-Knowledge阶段已提交3829ef06、tag v0.5.6，两远端核对current且工作区干净；本阶段仅维护TrainFlow/Wiki及其选定安装。按AGENTS约定拆分适配/容量/精度和优化/通信/诊断两个互斥审查范围，主控负责官方来源与最终集成。写入映射和允许路径见task_plan，KB只读。
+
+
+## 2026-11-18 镜像与工具准备流程
+
+已补主控/检查适配入口、共用环境指南、阅读导航和 Mermaid 阶段图；复核仅环境、指定镜像、裸机/Conda、完整适配、任务接续及环境变化场景，澄清镜像准备时的路线选择与后续基线核对。完整软件检查 1477 passed、4 平台条件项 skipped；知识校验、覆盖组织、Skill 阅读资源、现行文档四项检查通过。六个本机 Skill 及同根包元数据已同步至 0.8.5，独立 --check 返回 current。准备发布 lite/v0.8.5；最终远端 refs 与提交 CI 回执留在 .work/comprehensive-review-20261118/environment-preparation。本次未获取镜像或新增硬件验证。
