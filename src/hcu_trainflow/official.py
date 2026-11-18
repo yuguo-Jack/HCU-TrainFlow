@@ -588,7 +588,14 @@ def apply_refresh(store, project, stage_id):
             raise FlowError('Source registration changed; refresh and review the selected repository/ref')
         if set(stage['files'])&set(proofs) or set(stage['files'])|set(proofs)!=set(source.get('paths',[])):
             raise FlowError('Source registration changed or staged path coverage is incomplete; refresh and review again')
+    website_evidence = None
+    if source.get('kind') == 'web':
+        from . import web_evidence
+        website_evidence = web_evidence.retain_stage(store, project, source, stage)
     source['baseline_commit']=stage['commit'];source['baseline_files']=stage['files']
+    source['baseline_page_hashes'] = reviewed_pages
+    source['baseline_workflow_hashes'] = receipt.get('workflow_hashes', {})
+    source['baseline_workflow_pending'] = receipt.get('workflow_deferred', [])
     if proofs or 'baseline_absent_files' in source:source['baseline_absent_files']=proofs
     lock_path=Path(project)/'knowledge/source-lock.json'
     lock=read_json(lock_path)
@@ -610,7 +617,8 @@ def apply_refresh(store, project, stage_id):
     write_json(lock_path,lock);write_json(Path(project)/'knowledge/sources.json',registry)
     navigation=_maybe_catalog(store,project)
     return {'status':'content-applied','source':stage['source'],'commit':stage['commit'],
-            'workflow_pending':receipt.get('workflow_deferred',[]),'runtime_validated':False,'catalog':navigation}
+            'workflow_pending':receipt.get('workflow_deferred',[]),'runtime_validated':False,'catalog':navigation,
+            **({'website_evidence': website_evidence} if website_evidence else {})}
 
 
 def document_exclusions(source):
@@ -972,8 +980,18 @@ def _update_discovery_source(store,project,source,token,max_prs,since):
         result['stages']['check']={'commit':sha,'locked_commit':locked,'observed_at':utc(),
                                    'status':'unchanged' if sha==locked else 'changed'}
         if sha==locked:
-            result['stages']['content']={'status':'unchanged','commit':sha,'body_read':False,
-                                          'meaning':'Fixed inputs reused; authored facts and runtime behavior were not revalidated'}
+            if wiki.source_review_needed(store, project, source):
+                files = wiki.SourceFiles()
+                files.update(source['baseline_files'])
+                files.absence_proofs = source.get('baseline_absent_files', {})
+                result['stages']['content'] = wiki.stage_source_refresh(
+                    store, project, source, sha, files, [], source['ref'])
+                result['stages']['content'].update(body_read=False,
+                    meaning='Fixed bytes reused; changed authored consumers or deferred workflows still require review',
+                    next=['wiki-review', str(project), result['stages']['content']['stage_id']])
+            else:
+                result['stages']['content']={'status':'unchanged','commit':sha,'body_read':False,
+                                              'meaning':'Fixed inputs reused; authored facts and runtime behavior were not revalidated'}
         else:
             # The old full update verified this through inventory(). A light
             # update must retain that public boundary before staging bytes.

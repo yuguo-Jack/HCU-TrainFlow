@@ -241,6 +241,7 @@ def _run_command(store, tid, operation_id, card, lease, *, control_plane=False, 
     write_json(output / "plan.json", plan)
     started = time.monotonic()
     timed_out = False
+    proc, code, controller_error = None, None, None
     # Files, rather than in-memory pipes, retain large logs and survive controller crashes.
     with (output / "stdout.log").open("wb") as stdout, (output / "stderr.log").open("wb") as stderr:
         try:
@@ -253,14 +254,24 @@ def _run_command(store, tid, operation_id, card, lease, *, control_plane=False, 
                 proc.kill()
                 code = proc.wait()
         except OSError as exc:
-            code = -1
+            if proc is None:
+                code = -1  # Popen failed before returning a child to control.
+            else:
+                # A receipt/write/wait/kill error after spawn says nothing about
+                # the original child's outcome. Keep its intent/resource fenced;
+                # neither a replacement launch nor an implicit kill is safe.
+                controller_error = type(exc).__name__ + ": " + str(exc)
             stderr.write(str(exc).encode("utf-8"))
     artifacts = [store.put((output / x).read_bytes()) for x in ("stdout.log", "stderr.log", "plan.json")]
+    unresolved = timed_out or code is None or (plan["backend"] != "local" and code != 0)
     result = {"operation": operation_id, "returncode": code, "timed_out": timed_out, "seconds": time.monotonic() - started,
               "context": task["context"], "context_epoch": task['context_epoch'], "evidence": artifacts,
-              "status": "unknown" if timed_out or (plan["backend"] != "local" and code != 0) else ("complete" if code == 0 else "failed"),
+              "status": "unknown" if unresolved else ("complete" if code == 0 else "failed"),
               "validation": "unassessed; exit zero does not establish numerical or performance correctness",
-              "remote_outcome": "reconcile-required" if plan["backend"] != "local" and (timed_out or code != 0) else "command-returned"}
+              "remote_outcome": "reconcile-required" if unresolved else "command-returned"}
+    if controller_error:
+        result["controller_error"] = controller_error
+        result["local_transport_pid"] = proc.pid  # Reconciliation clue, never authority to signal a PID.
     write_json(output / "result.json", result)
     with store.db() as db:
         # Record facts even if the lease expired; no subsequent action is authorized by this record.

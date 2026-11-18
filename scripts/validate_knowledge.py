@@ -244,6 +244,8 @@ def validate(root):
     errors.extend(validate_dependency_sources(root, sources, pages))
     errors.extend(validate_project_layout(root, sources, pages))
     errors.extend(validate_manifests(root))
+    from hcu_trainflow.web_evidence import validate as validate_web_originals
+    errors.extend(validate_web_originals(root))
     return {'pages':len(ids),'sources':len(sources),'errors':errors}
 
 

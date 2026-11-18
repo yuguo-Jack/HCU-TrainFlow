@@ -67,7 +67,7 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 | 验收 | occupancy-check、environment-check、proxy-check、iteration-check、quality-check |
 | 分析 | profile-plan、profile-analyze、tracelens-report、tracelens-collective、tracelens-analyze |
 | 长训 | observe-training、watch、heartbeat-check、events-export/import、monitor-report |
-| HCU-TrainFlow-Wiki | wiki-index/search/read/search-pr/pr/code、wiki-update/inventory/triage/sync-docs/sync-prs/refresh/review/review-pr/apply/catalog/routes |
+| HCU-TrainFlow-Wiki | wiki-index/search/read/original/search-pr/pr/code、wiki-update/inventory/triage/sync-docs/sync-prs/refresh/review/review-pr/apply/catalog/routes |
 | 私有训练经验 | experience-record/sync/index/search/read/compare |
 | 条件参考 | reference-record/query，用于任务内硬件、环境与单测参考 |
 | 公开交付 | public-export |

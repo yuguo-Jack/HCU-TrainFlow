@@ -83,3 +83,5 @@ HCU 仓库的目录、构建、源码、PR 和案例由 HCU-Knowledge 维护。�
 2026-11-18 的独立联动输入为 HCU-Knowledge `v0.6.3` / `a3a5be5`；本次[内容与流程复核收据](catalog/review-20261118.json)、[原件/在线阅读检查](catalog/reader-check-20261118.json)和[许可复核](catalog/license-review-20261118.json)随仓保留。固定源码阅读、软件检查和 HCU 现场资格分别记录。
 
 容错命令的补充复核、实际遗漏及修复验证见 [0.8.3 命令与流程复核](catalog/fault-command-review-20261118.json)；来源沿用上述已发布大库，普通查询仍按原入口使用。
+
+已发布版本的再次全面复核见[执行、Wiki 与安装复核收据](catalog/comprehensive-review-20261118.json)。它修复进程启动后的未知状态保护、共享网页原件与同版本待审闭环；HCU-Knowledge 的联动锁只推进到已核验的 lite 用法修订，来源事实和现场训练资格按原固定证据保留。

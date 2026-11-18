@@ -113,6 +113,10 @@ def parser():
     q.add_argument('--engine'); q.add_argument('--source'); q.add_argument('--repo',action='append',default=[])
     q.add_argument('--limit',type=int,default=10); q.add_argument('--state',choices=['all','open','closed','merged'],default='all'); q.add_argument('--branch'); q.add_argument('--page',type=int,default=1)
     q = cmd('wiki-code','repository','commit','path'); q.add_argument('--max-chars',type=int,default=24000)
+    q = cmd('wiki-original', 'project', 'source', 'path')
+    q.add_argument('--revision', help='Full fixed website content fingerprint; defaults to applied baseline')
+    q.add_argument('--text', action='store_true', help='Display extracted text rather than original HTML')
+    q.add_argument('--max-chars', type=int, default=24000)
     q = cmd('wiki-inventory','project','source'); q.add_argument('--retain',action='store_true')
     cmd('wiki-triage','project','source','decisions')
     q = cmd('wiki-sync-prs','project','source'); q.add_argument('--max-prs',type=int,default=10); q.add_argument('--since')
@@ -134,6 +138,9 @@ def execute(a):
     from . import admission, analysis, coordination, delivery, environment, execution, flow, monitor, quality, team, wiki, official, experience
     from .maintenance_branch import guard_cli
     guard_cli(a)
+    if a.command == 'wiki-original':
+        from .web_evidence import read_original
+        return read_original(a.project, a.source, a.path, revision=a.revision, text=a.text, max_chars=a.max_chars)
     store = Store(a.workspace)
     c = a.command
     if c == "init": return {"workspace": str(store.root), "schema_version": 1, "version": __version__}

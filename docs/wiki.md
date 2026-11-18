@@ -70,6 +70,15 @@ hcu-trainflow wiki-search "weight transfer" --engine vllm --kind source-document
 
 多 Agent 或多个 checkout 共用私有工作区时，后续全文读取使用 `wiki-read PAGE_ID --generation SEARCH_RETURNED_GENERATION`，保证读取刚才命中的同一快照；也可 `--project PROJECT` 明确读取该工程当前本地版本。省略两者只兼容使用最近的 active 索引，不适合并发跨工程读取。
 
+登记官网的固定 HTML 与提取正文随已应用版本保留，可直接从 checkout 强校验读取：
+
+```bash
+hcu-trainflow wiki-original PROJECT nvidia-transformerengine-docs installation
+hcu-trainflow wiki-original PROJECT nvidia-transformerengine-docs installation --text
+```
+
+默认使用该来源当前基线；历史版本加 `--revision FULL_CONTENT_FINGERPRINT`，不是 Git SHA。返回 `local_path` 指向完整共享原件，`--max-chars` 只限制响应预览。读取同时检查 HTML/正文的 SHA、字节数和固定来源锁，不需要原任务 Store，也不自动重新采集；缺失或未水合的字节明确报错。页面图像、资源附件仍按其固定链接核对，不能由正文抓取推断已经保留。
+
 lite 的 `wiki-search --online-pr auto` 在本地无候选、词项覆盖不足、命中页已变化，或问题明确要求最新进展/PR 时联搜线上 PR。显式 engine/source/repo 范围完整保留；未指定范围时只从本地候选推断最多 3 个有效引擎、6 个仓库，无可靠范围则提示先选仓，不随机扫仓。这只是候选充分性检查，不表示语义答案已验证。**有结果但不能回答问题**时，Agent 仍需主动 `wiki-search-pr` 或 `--online-pr always`。纯离线用 `--online-pr off`，旧非 lite 工程保留零命中回退行为。
 
 ```bash
@@ -154,9 +163,13 @@ python scripts/validate_knowledge.py
 
 decisions 结构为 `{"pages":{PATH:DECISION},"workflows":{PATH:DECISION}}`。apply 再核对页哈希和最新采集版本，才写公共锁/基线，历史固定证据继续保留。PR 初始描述和最终代码不同必须明确记录。
 
+官网 apply 先将已登记路径的 HTML 与提取正文按内容哈希保存到 `knowledge/evidence/web/`，读回验字节，再维护 `knowledge/catalog/web-originals.json` 和固定锁；相同字节复用文件。既有带日期原件收据继续有效，历史记录不改写。正式知识所需的原件随仓共享，私有采集 Store 只承担更新过程记录。
+
 复核同时绑定同来源页面和已复核工作流的当前哈希。复核后修改正文、新增关联专题或修改工作流，会重新产生待复核项；上游内容不变也不会清掉这些项。删除来源标注而保留正文也需要明确复核。无变化的再次复核保留原哈希绑定，不能用空 decisions 绕过后来发生的编辑。PR 重采也检查关联作者页是否变化。staging 之后新增关联页需重新 staging，apply 之前再次改动则拒绝沿用旧回执。
 
 涉及现场 HCU 命令/工具且暂时无法验证时，允许 `wiki-review ... --defer-workflows "具体现场缺口"` 完成知识内容复核。未完工作流项单独保存，下次仍会出现；不称 Skill 已现场通过。第三方工具运行版本与任务快照独立管理。
+
+同一固定版本再次 `wiki-update` 时，延后项或已审正文/工作流的本地变更仍返回待复核 stage 与继续入口；来源未变只复用固定字节。新的 apply 将审查哈希与未完目标写入共享基线，冷 checkout 也保留这些待办；旧基线未记录的审查状态仍不得冒称已重新验收。
 
 ## 频度、备份和限制
 

@@ -225,3 +225,147 @@ def test_catalog_refreshes_only_navigation_inputs(tmp_path):
     write_json(root/'knowledge/sources.json',registry)
     assert official._maybe_catalog(store,root)['rebuilt']
     assert 'https://github.com/org/new' in (root/'knowledge/catalog/README.md').read_text(encoding='utf-8')
+
+
+def test_unchanged_source_keeps_deferred_workflow_visible_even_in_cold_checkout(tmp_path, monkeypatch):
+    import shutil
+    root = project(tmp_path); store = Store(tmp_path/'private')
+    target = root/'docs/guide.md';target.parent.mkdir();target.write_text('Needs review', encoding='utf-8')
+    write_json(root/'knowledge/maintenance.json', [{'source':'engine','paths':['a.py'],'targets':['docs/guide.md']}])
+    source = read_json(root/'knowledge/sources.json')[0]
+    staged = wiki.stage_source_refresh(store,root,source,B,{'a.py':{'sha256':NEW}},[],'main')
+    wiki.review_refresh(store,staged['stage_id'],{},root,defer_workflows='Site review remains required')
+    official.apply_refresh(store,root,staged['stage_id'])
+    cold = tmp_path/'cold';shutil.copytree(root,cold)
+    monkeypatch.setattr(official,'api',api_at(B))
+    monkeypatch.setattr(wiki,'refresh_source',lambda *a,**kw:pytest.fail('Unchanged fixed bytes need no download'))
+    for checkout, private in [(root,store),(cold,Store(tmp_path/'cold-private'))]:
+        result = official.update_source(private,checkout,'engine')
+        content = result['stages']['content']
+        assert result['status']=='pending-content-review' and content['body_read'] is False
+        assert content['affected_workflows']==['docs/guide.md']
+        assert content['next'][:1]==['wiki-review']
+        decision={'decision':'still-applicable','note':'Completed the required fixed-version workflow review',
+                  'page_sha256':hashlib.sha256((checkout/'docs/guide.md').read_bytes()).hexdigest(),
+                  'source_commit':B}
+        wiki.review_refresh(private,content['stage_id'],{},checkout,workflow_decisions={'docs/guide.md':decision})
+        official.apply_refresh(private,checkout,content['stage_id'])
+        assert official.update_source(private,checkout,'engine')['status']=='unchanged'
+
+
+@pytest.mark.parametrize('change', ['author-edited','author-added','citation-removed','workflow-edited'])
+def test_unchanged_source_checks_portable_review_hashes_without_fetching(tmp_path,monkeypatch,change):
+    import shutil
+    root = project(tmp_path); store = Store(tmp_path/'private')
+    page = root/'knowledge/topic.md'
+    page.write_text('---\nid: topic\nsources: [{source: engine}]\n---\nKnown explanation',encoding='utf-8')
+    target = root/'docs/guide.md';target.parent.mkdir();target.write_text('Known workflow',encoding='utf-8')
+    write_json(root/'knowledge/maintenance.json',[{'source':'engine','paths':['a.py'],'targets':['docs/guide.md']}])
+    source = read_json(root/'knowledge/sources.json')[0]
+    staged = wiki.stage_source_refresh(store,root,source,B,{'a.py':{'sha256':NEW}},[],'main')
+    decision = lambda p:{'decision':'still-applicable','note':'Checked fixed source and consumers',
+                        'page_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'source_commit':B}
+    wiki.review_refresh(store,staged['stage_id'],{'knowledge/topic.md':decision(page)},root,
+                        workflow_decisions={'docs/guide.md':decision(target)})
+    official.apply_refresh(store,root,staged['stage_id'])
+    cold = tmp_path/'cold';shutil.copytree(root,cold)
+    page = cold/'knowledge/topic.md';target = cold/'docs/guide.md'
+    if change=='workflow-edited':
+        target.write_text('New workflow contract',encoding='utf-8')
+    elif change=='author-added':
+        (cold/'knowledge/new.md').write_text(page.read_text(encoding='utf-8').replace('id: topic','id: new'),encoding='utf-8')
+    else:
+        page.write_text(page.read_text(encoding='utf-8').replace(
+            'sources: [{source: engine}]' if change=='citation-removed' else 'Known explanation',
+            'sources: []' if change=='citation-removed' else 'Changed explanation'),encoding='utf-8')
+    monkeypatch.setattr(official,'api',api_at(B))
+    monkeypatch.setattr(wiki,'refresh_source',lambda *a,**kw:pytest.fail('Do not refetch unchanged source'))
+    result=official.update_source(Store(tmp_path/'cold-private'),cold,'engine')
+    assert result['status']=='pending-content-review'
+    content=result['stages']['content']
+    assert content['body_read'] is False
+    if change=='workflow-edited':
+        assert content['affected_workflows']==['docs/guide.md']
+    else:
+        assert [r['page'] for r in content['affected_pages']]==[
+            'knowledge/new.md' if change=='author-added' else 'knowledge/topic.md']
+
+
+@pytest.mark.parametrize('consumer', ['author','workflow'])
+def test_private_review_for_another_version_cannot_certify_current_consumers(tmp_path,monkeypatch,consumer):
+    root=project(tmp_path);store=Store(tmp_path/'private')
+    page=root/'knowledge/topic.md'
+    page.write_text('---\nid: topic\nsources: [{source: engine}]\n---\nOriginal',encoding='utf-8')
+    workflow=root/'guide.md';workflow.write_text('Original workflow',encoding='utf-8')
+    registry=read_json(root/'knowledge/sources.json')
+    source=registry[0]
+    source['baseline_page_hashes']={'knowledge/topic.md':hashlib.sha256(page.read_bytes()).hexdigest()}
+    source['baseline_workflow_hashes']={'guide.md':hashlib.sha256(workflow.read_bytes()).hexdigest()}
+    write_json(root/'knowledge/sources.json',registry)
+    changed=page if consumer=='author' else workflow
+    changed.write_text(changed.read_text(encoding='utf-8')+'\nChanged for another version',encoding='utf-8')
+    write_json(store.root/'wiki/reviewed-sources/engine.json',{'commit':B,'files':{'a.py':{'sha256':NEW}},
+               'page_hashes':{'knowledge/topic.md':hashlib.sha256(page.read_bytes()).hexdigest()},
+               'workflow_hashes':{'guide.md':hashlib.sha256(workflow.read_bytes()).hexdigest()}})
+    monkeypatch.setattr(official,'api',api_at(A))
+    monkeypatch.setattr(wiki,'refresh_source',lambda *a,**kw:pytest.fail('The applied fixed source did not change'))
+    result=official.update_source(store,root,'engine')
+    assert result['status']=='pending-content-review'
+    content=result['stages']['content']
+    assert content['changed_paths']==[]  # Compare against applied A, not private un-applied B.
+    if consumer=='author':
+        assert [r['page'] for r in content['affected_pages']]==['knowledge/topic.md']
+    else:
+        assert content['affected_workflows']==['guide.md']
+
+
+def test_legacy_review_hashes_still_detect_authored_edits(tmp_path):
+    root=project(tmp_path);store=Store(tmp_path/'private')
+    page=root/'knowledge/topic.md'
+    page.write_text('---\nid: topic\nsources: [{source: engine}]\n---\nBefore',encoding='utf-8')
+    previous=hashlib.sha256(page.read_bytes()).hexdigest()
+    write_json(store.root/'wiki/reviewed-sources/engine.json',{'commit':A,
+               'affected_pages':[{'page':'knowledge/topic.md','page_sha256':previous}]})
+    source=read_json(root/'knowledge/sources.json')[0]
+    assert not wiki.source_review_needed(store,root,source)
+    page.write_text(page.read_text(encoding='utf-8')+'\nChanged',encoding='utf-8')
+    assert wiki.source_review_needed(store,root,source)
+
+
+@pytest.mark.parametrize('consumer', ['author','workflow'])
+def test_same_revision_private_review_cannot_hide_pending_public_apply(tmp_path,monkeypatch,consumer):
+    import shutil
+    root=project(tmp_path);store=Store(tmp_path/'private')
+    page=root/'knowledge/topic.md'
+    page.write_text('---\nid: topic\nsources: [{source: engine}]\n---\nKnown',encoding='utf-8')
+    workflow=root/'guide.md';workflow.write_text('Known workflow',encoding='utf-8')
+    write_json(root/'knowledge/maintenance.json',[{'source':'engine','paths':['a.py'],'targets':['guide.md']}])
+    decide=lambda path:{'decision':'still-applicable','note':'Verified the fixed source consumers',
+                        'page_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'source_commit':B}
+    source=read_json(root/'knowledge/sources.json')[0]
+    staged=wiki.stage_source_refresh(store,root,source,B,{'a.py':{'sha256':NEW}},[],'main')
+    wiki.review_refresh(store,staged['stage_id'],{'knowledge/topic.md':decide(page)},root,
+                        workflow_decisions={'guide.md':decide(workflow)})
+    official.apply_refresh(store,root,staged['stage_id'])
+    changed=page if consumer=='author' else workflow
+    changed.write_text(changed.read_text(encoding='utf-8')+'\nNew explanation',encoding='utf-8')
+    source=read_json(root/'knowledge/sources.json')[0]
+    staged=wiki.stage_source_refresh(store,root,source,B,source['baseline_files'],[],'main')
+    wiki.review_refresh(store,staged['stage_id'],
+        {'knowledge/topic.md':decide(page)} if consumer=='author' else {},root,
+        workflow_decisions={'guide.md':decide(workflow)} if consumer=='workflow' else {})
+    # Deliberately stop before apply: neither the source revision nor the
+    # reviewed public consumer hashes have advanced.
+    public_binding=(root/'knowledge/sources.json').read_bytes()
+    cold=tmp_path/'cold';shutil.copytree(root,cold)
+    monkeypatch.setattr(official,'api',api_at(B))
+    monkeypatch.setattr(wiki,'refresh_source',lambda *a,**kw:pytest.fail('Unchanged source bytes need no download'))
+    for checkout, private in [(root,store),(cold,Store(tmp_path/'cold-private'))]:
+        result=official.update_source(private,checkout,'engine')
+        assert result['status']=='pending-content-review'
+        content=result['stages']['content']
+        if consumer=='author':
+            assert [row['page'] for row in content['affected_pages']]==['knowledge/topic.md']
+        else:
+            assert content['affected_workflows']==['guide.md']
+    assert (root/'knowledge/sources.json').read_bytes()==public_binding

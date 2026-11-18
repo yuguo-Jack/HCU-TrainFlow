@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.4 — 2026-11-18
+
+- Keep an operation unresolved when the child has started but process-receipt, wait or termination control fails. Preserve reconciliation clues and resource/inbox fences; a controller error cannot authorize a duplicate launch.
+- Retain applied registered website HTML and extracted text as shared, hash-verified originals. Reuse existing evidence, preserve history, validate source locks and add offline `wiki-original` reading independent of the acquisition Store.
+- Surface deferred workflow review and changed authored consumers even when the fixed upstream commit is unchanged. Bind applied review hashes and pending targets into the portable source baseline.
+- Review cross-repository entry points and synchronize the selected local Skills/package. This is a software and documentation review; source training dependencies and hardware qualification remain separately pinned.
+
 ## 0.8.3 — 2026-11-18
 
 - Keep an old observation launch inspectable and precisely stoppable after the task context changes. Admit starts against the current context in both the CLI and Python API; preserve exact configuration, process identity, argv and pidfd stop checks.

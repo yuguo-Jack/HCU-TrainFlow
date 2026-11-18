@@ -474,11 +474,50 @@ def source_page_hashes(project, source_id):
     return result
 
 
+def _reviewed_source(store, source):
+    baseline = {'files': source.get('baseline_files', {})}
+    for name in ('page_hashes', 'workflow_hashes'):
+        if 'baseline_' + name in source:
+            baseline[name] = source['baseline_' + name]
+    # Public hashes are written only by apply_refresh. A private review of the
+    # same source revision may still be waiting for apply and must not make a
+    # warm checkout report unchanged while a cold checkout reports pending.
+    if 'page_hashes' in baseline or 'workflow_hashes' in baseline:
+        return baseline
+    path = store.root / 'wiki/reviewed-sources' / (source['id'] + '.json')
+    if path.is_file():
+        reviewed = read_json(path)
+        # An un-applied or older private review cannot certify consumers of
+        # the public applied baseline after a pull or source branch rollback.
+        if not source.get('baseline_commit') or reviewed.get('commit') == source['baseline_commit']:
+            return reviewed
+    return baseline
+
+
+def source_review_needed(store, project, source):
+    """Detect unresolved or changed consumers without downloading source bytes.
+
+    Old applied baselines need not have portable review hashes. Their lack of
+    tracking is not a claim that current authored content has been revalidated.
+    """
+    reviewed = _reviewed_source(store, source)
+    pending_path = store.root / 'wiki/workflow-pending' / (source['id'] + '.json')
+    if source.get('baseline_workflow_pending') or (pending_path.is_file() and read_json(pending_path).get('targets')):
+        return True
+    hashes = reviewed.get('page_hashes')
+    if hashes is None and 'affected_pages' in reviewed:
+        hashes = {row['page']: row['page_sha256'] for row in reviewed['affected_pages']}
+    if hashes is not None and source_page_hashes(project, source['id']) != layout.current_hashes(project, hashes):
+        return True
+    workflows = reviewed.get('workflow_hashes', {})
+    return any(not child(project, name).is_file() or digest(child(project, name).read_bytes()) != sha
+               for name, sha in layout.current_hashes(project, workflows).items())
+
+
 def stage_source_refresh(store, project, source, sha, files, failures, ref):
     source_id, repo = source['id'], source['repository']
     cursor_path = store.root / 'wiki/sources' / (source_id + '.json')
-    reviewed_path = store.root / "wiki/reviewed-sources" / (source_id + ".json")
-    reviewed = read_json(reviewed_path) if reviewed_path.exists() else {"files": source.get("baseline_files", {})}
+    reviewed = _reviewed_source(store, source)
     changes = sorted(name for name in files.keys() | reviewed["files"].keys()
                      if files.get(name, {}).get("sha256") != reviewed["files"].get(name, {}).get("sha256")
                      or (source.get('kind') == 'web' and files.get(name, {}).get('url') != reviewed['files'].get(name, {}).get('url')))
@@ -500,6 +539,7 @@ def stage_source_refresh(store, project, source, sha, files, failures, ref):
             if rule["source"] == source_id and any(name in changes for name in rule["paths"]):
                 maintenance.extend(rule["targets"])
     pending_path=store.root/'wiki/workflow-pending'/(source_id+'.json')
+    maintenance.extend(layout.current_path(project, name) for name in source.get('baseline_workflow_pending', []))
     if pending_path.exists():
         maintenance.extend(layout.current_path(project,name) for name in read_json(pending_path).get('targets',[]))
     reviewed_workflows = layout.current_hashes(project, reviewed.get('workflow_hashes', {}))

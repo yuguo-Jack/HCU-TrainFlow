@@ -239,6 +239,8 @@ hcu-trainflow --workspace /private/controller command-group-reconcile GROUP_OPER
 
 operation ID 不重复执行已完成请求。超时、SSH 断线或 started 状态残留需核对远端进程、job 和输出，上传证据后 `operation-reconcile`。不能只换一个 operation ID 就重发训练。Python fencing 防止本工作区的过期拥有者发新动作；跨机器的真实运行隔离还依赖站点调度器。
 
+本地子进程已启动后，进程凭证写入、等待或终止调用失败也保持 `unknown`，返回 `returncode: null`、`controller_error` 和 `remote_outcome: reconcile-required`；先核对原进程，不能当作确定失败重派。`local_transport_pid` 只提供本地主控子进程的对账线索，不是远端训练 PID，也不授权对该号码发信号。若终态写入本身失败，持久化的 `started` 意图仍阻止重派；两种情况均须保留原 operation 并按证据核销。只有在本地 `Popen` 未返回子进程就失败时，才记录确定的本地启动失败；远端命令的非零结果仍按未知处理。
+
 单命令的执行和核销也使用与命令组相同的 operation 进程锁，锁覆盖登记意图、启动子进程、等待和写入终态的整个范围。主控仍活跃时，即便暂时没有发现子进程，也不能提前核销：主控可能正在启动前等待，随后仍会派发。主控退出后锁由操作系统释放；这只允许开始基于证据的核销，不证明远端子进程已经退出。不要删除工作区的 `command-group-locks` 锁文件；历史目录名同时承载单命令与命令组锁，两个 API 不得各自使用不同锁域。
 
 核销未知操作后仍保留其超时预算占用，记为 `budget_seconds`；不会因为缺少本地主控的耗时结果就按零计费。这是保守预算核算，不是伪造的远程实测耗时。任务总预算和 assignment 预算都遵循此规则。资源被领取中的 assignment 整体预约时，无 assignment 身份的主控命令也不能绕过预约。

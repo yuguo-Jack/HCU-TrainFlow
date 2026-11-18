@@ -1,5 +1,6 @@
 """CPU-only recovery boundaries; simulated intents are explicitly labeled."""
 import json
+import subprocess
 import sys
 
 import pytest
@@ -248,3 +249,108 @@ def test_intervening_failed_dispatch_does_not_replay_stale_attempt(tmp_path, mon
     assert nested[0]["operation"] != result["operation"]
     assert (tmp_path / "calls").read_text() == "xx"
     assert inbox_item(store, eid)["attempts"] == 2 and inbox_item(store, eid)["status"] == "retry"
+
+
+@pytest.mark.parametrize("failure", ["process-receipt", "wait", "kill"])
+def test_post_spawn_controller_error_keeps_original_execution_unresolved(tmp_path, monkeypatch, failure):
+    """All child/process-control actions are mocked; no signal or child starts."""
+    store = make_store(tmp_path)
+    lease = store.lease("cpu-controller-error", "controller", ttl=60)
+    calls = []
+
+    class Child:
+        pid = 12345
+
+        def wait(self, timeout=None):
+            calls.append("wait")
+            if failure == "kill":
+                raise subprocess.TimeoutExpired("synthetic-command", timeout)
+            raise OSError("synthetic wait failure")
+
+        def kill(self):
+            calls.append("kill")
+            raise OSError("synthetic kill failure")
+
+    def spawn(*args, **kwargs):
+        calls.append("spawn")
+        return Child()
+
+    original_write = execution.write_json
+
+    def write(path, value):
+        if path.name == "process.json" and failure == "process-receipt":
+            raise OSError("synthetic process receipt write failure")
+        original_write(path, value)
+
+    monkeypatch.setattr(execution.subprocess, "Popen", spawn)
+    monkeypatch.setattr(execution, "write_json", write)
+    result = execution.run_command(store, "t", "original-controller-error", command(tmp_path), lease)
+    assert result["status"] == "unknown" and result["returncode"] is None
+    assert result["controller_error"].startswith("OSError: synthetic")
+    assert result["local_transport_pid"] == Child.pid
+    assert result["remote_outcome"] == "reconcile-required"
+    assert result["timed_out"] is (failure == "kill")
+    expected_calls = ["spawn"] + ([] if failure == "process-receipt" else ["wait"]) + (["kill"] if failure == "kill" else [])
+    assert calls == expected_calls
+    with store.db() as db:
+        row = db.execute("SELECT status,result FROM operations WHERE id='original-controller-error'").fetchone()
+        assert row["status"] == "unknown" and json.loads(row["result"]) == result
+    for oid in ("original-controller-error", "replacement-controller-error"):
+        with pytest.raises(FlowError):
+            execution.run_command(store, "t", oid, command(tmp_path), lease)
+    with pytest.raises(FlowError, match="unresolved"):
+        store.lease("cpu-controller-error", "replacement")
+    assert calls == expected_calls
+    assert flow.next_step(store, "t")["action"] == "reconcile"
+    proof = store.put(b"Synthetic review: original child independently reconciled; no real process started")
+    reconcile_operation(store, "original-controller-error", "failed", [proof], "Original simulated process outcome checked")
+    assert flow.next_step(store, "t")["action"] == "work"
+
+
+@pytest.mark.parametrize("backend,expected", [("local", "failed"), ("ssh", "unknown")])
+def test_pre_spawn_oserror_preserves_backend_failure_contract(tmp_path, monkeypatch, backend, expected):
+    store = make_store(tmp_path)
+    lease = store.lease("cpu-spawn-error", "controller", ttl=60)
+
+    def no_child(*args, **kwargs):
+        raise OSError("synthetic executable unavailable; no child created")
+
+    monkeypatch.setattr(execution.subprocess, "Popen", no_child)
+    result = execution.run_command(store, "t", "spawn-error", command(tmp_path, backend=backend, ssh_target="fixture"), lease)
+    assert result["status"] == expected and result["returncode"] == -1
+    assert "controller_error" not in result
+    assert b"synthetic executable unavailable" in store.artifact(result["evidence"][1])
+
+
+def test_post_spawn_delivery_error_does_not_requeue_claimed_incident(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    eid = event(store)
+    lease = store.lease("cpu-delivery-error", "controller", ttl=60)
+    calls = []
+
+    class Child:
+        pid = 12345
+
+        def wait(self, timeout=None):
+            pytest.fail("Receipt failed before wait; original process needs reconciliation")
+
+    def spawn(*args, **kwargs):
+        calls.append("spawn")
+        return Child()
+
+    original_write = execution.write_json
+
+    def write(path, value):
+        if path.name == "process.json":
+            raise OSError("synthetic post-spawn delivery write failure")
+        original_write(path, value)
+
+    monkeypatch.setattr(execution.subprocess, "Popen", spawn)
+    monkeypatch.setattr(execution, "write_json", write)
+    result = dispatch_inbox(store, eid, "consumer", command(tmp_path), lease)
+    assert result["status"] == "unknown" and result["bridge_delivery"] == "unconfirmed"
+    assert inbox_item(store, eid)["status"] == "claimed"
+    assert inbox_item(store, eid)["attempts"] == 1
+    with pytest.raises(FlowError, match="already claimed"):
+        dispatch_inbox(Store(store.root), eid, "replacement", command(tmp_path), lease)
+    assert calls == ["spawn"]
