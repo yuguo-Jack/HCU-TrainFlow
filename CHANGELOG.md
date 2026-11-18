@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.3 — 2026-11-18
+
+- Keep an old observation launch inspectable and precisely stoppable after the task context changes. Admit starts against the current context in both the CLI and Python API; preserve exact configuration, process identity, argv and pidfd stop checks.
+- Make the published monitoring policy usable with phase-aware observations by including its independent startup allowance. Add regression coverage for the template, old-context lifecycle handling and changed-scope rejection.
+- Correct the current envcheck scenario/operation layers and staged result layout, phase/cleanup status and final exits. Clarify the real recovery console, launcher environment, NRE wheel builder and SaFE installation entry; track the actual command/result consumers for future maintenance.
+- Reconcile workflow/Skill navigation and lite maintenance descriptions, then synchronize the selected local installation. This review adds software evidence, with no new training, hardware or fault-injection qualification.
+
 ## 0.8.2 — 2026-11-18
 
 - Review the 24 registered official sources at fixed revisions and revise affected guides, topics and workflows. Preserve historical evidence, parent-selected child commits, proven removals and explicit deployment/runtime gaps; use the official Hyperloom repository after the personal fork was deleted.

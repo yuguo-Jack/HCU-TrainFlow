@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 任务模板 | [task.json](task.json) | 分析任务的目标、上下文、权限和预算；复制后填入真实任务身份与证据，权限按已授权范围设置 |
 | 执行模板 | [ssh-docker-card.json](ssh-docker-card.json) | SSH + Docker 命令卡；替换站点别名、容器、工作目录和命令，并核对实际映射及 CLI |
-| 监测模板 | [monitor-policy.json](monitor-policy.json)、[trainflow-watch.service](trainflow-watch.service) | 停滞、遥测、恢复与性能阈值，以及 systemd watcher 模板；按训练节奏和站点规则调整，替换服务里的占位符后再部署 |
+| 监测模板 | [monitor-policy.json](monitor-policy.json)、[trainflow-watch.service](trainflow-watch.service) | 启动/编译、停滞、遥测、恢复与性能阈值，以及 systemd watcher 模板；按[观测策略](../docs/training-observation.md)为实际任务配置独立预算，替换服务里的占位符后再部署 |
 | 更新复核模板 | [review-decisions.json](review-decisions.json) | Wiki 页面与工作流复核结论的空结构；填写真实复核结果，空对象不代表已完成复核 |
 | 合成并行上下文 | [groups.json](groups.json)、[process-groups.json](process-groups.json) | 两个 rank 的 DP 示例；前者还含可用 rank，分别供采样计划与分析使用。真实任务需提供实际进程组 |
 | 合成性能输入 | [trace.json](trace.json)、[window.json](window.json)、[models.json](models.json) | 简化 GEMM 时间线、分析窗口与性能上限模型；模型中的峰值明确为测试值，不能作为 HCU 硬件参数 |

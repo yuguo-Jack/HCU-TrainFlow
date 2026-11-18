@@ -219,6 +219,68 @@ def test_exact_pidfd_stop_signals_only_observer(manager, spec, monkeypatch):
     assert list(Path(record["run_dir"]).glob("stop-result-*.json"))
 
 
+def test_cli_retains_exact_status_and_stop_after_context_change(manager, spec, monkeypatch, capsys):
+    record = recorded(spec)
+    Store(spec["workspace"]).change_context(spec["task"], {"source": "next synthetic context"})
+    state = [alive(record)]
+    monkeypatch.setattr(manager, "sys", SimpleNamespace(platform="linux", stderr=sys.stderr))
+    monkeypatch.setattr(manager, "process_identity", lambda pid: state[0])
+    monkeypatch.setattr(manager.subprocess, "Popen", lambda *a, **k: pytest.fail("must not start an old context"))
+    monkeypatch.setattr(manager.os, "pidfd_open", lambda pid: 999 if pid == record["process"]["pid"] else pytest.fail("training PID"), raising=False)
+    monkeypatch.setattr(manager.os, "close", lambda fd: None)
+    original_read = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda path: b"python\0observer.py\0" if str(path).replace("\\", "/") == "/proc/456/cmdline" else original_read(path))
+    data = {"checked_at": manager.time.time(), "result": {"status": "healthy-observed", "monitor": {"completion_verified": False}}}
+    receipt(record, "ready.json", **data)
+    receipt(record, "heartbeat.json", **data)
+    signals = []
+
+    def send(fd, sig):
+        signals.append((fd, sig))
+        state[0] = {"status": "exited", "identity": record["process"], "process_state": "Z"}
+        receipt(record, "observer-exit.json", reason="observer-stop-requested", exit_code=143)
+
+    monkeypatch.setattr(manager.signal, "pidfd_send_signal", send, raising=False)
+    args = ["--workspace", spec["workspace"], "--task", spec["task"],
+            "--manifest", spec["manifest"], "--policy", spec["policy"]]
+    assert manager.main(["status", *args]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "observing"
+    assert manager.main(["start", *args]) == 1
+    assert "context differ" in capsys.readouterr().err
+    assert signals == []
+    assert manager.main(["stop", *args]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "stopped"
+    assert signals == [(999, manager.signal.SIGTERM)]
+
+
+def test_start_api_rechecks_current_context_before_spawn(manager, spec, monkeypatch):
+    Store(spec["workspace"]).change_context(spec["task"], {"source": "next synthetic context"})
+    reconstructed = manager.make_spec(spec["workspace"], spec["task"], spec["manifest"], spec["policy"],
+                                      require_current_context=False)
+    assert reconstructed == spec
+    monkeypatch.setattr(manager.subprocess, "Popen", lambda *a, **k: pytest.fail("must not spawn an old-context observer"))
+    for old_spec in (spec, reconstructed):
+        with pytest.raises(FlowError, match="context differ"):
+            manager.start_observer(old_spec)
+
+
+@pytest.mark.parametrize("change", ["attempt", "policy"])
+def test_cli_old_context_stop_still_rejects_changed_scope(manager, spec, monkeypatch, capsys, change):
+    recorded(spec)
+    Store(spec["workspace"]).change_context(spec["task"], {"source": "next synthetic context"})
+    path = Path(spec["manifest"] if change == "attempt" else spec["policy"])
+    value = json.loads(path.read_text())
+    value["attempt_id" if change == "attempt" else "stall_seconds"] = "a2" if change == "attempt" else 61
+    write_json(path, value)
+    monkeypatch.setattr(manager, "sys", SimpleNamespace(platform="linux", stderr=sys.stderr))
+    monkeypatch.setattr(manager.os, "pidfd_open", lambda *a: pytest.fail("must reject changed scope before pidfd"), raising=False)
+    monkeypatch.setattr(manager.signal, "pidfd_send_signal", lambda *a: pytest.fail("must not signal a different scope"), raising=False)
+    args = ["stop", "--workspace", spec["workspace"], "--task", spec["task"],
+            "--manifest", spec["manifest"], "--policy", spec["policy"]]
+    assert manager.main(args) == 1
+    assert "different attempt or configuration" in capsys.readouterr().err
+
+
 def test_changed_command_never_signaled(manager, spec, monkeypatch):
     record = recorded(spec)
     monkeypatch.setattr(manager, "process_identity", lambda pid: alive(record))

@@ -81,3 +81,5 @@ HCU 仓库的目录、构建、源码、PR 和案例由 HCU-Knowledge 维护。�
 收录前先按[内容筛选规则](../docs/knowledge-architecture.md)检查相关性和复用价值。来源配置的 `document_scope` 说明范围，`document_exclusions` 保存排除路径及理由；增量同步不会恢复已排除页，保留页与排除规则冲突时先明确整理。完整源码导航和线上 PR 检索仍保留。更新时同时复核同仓总览、专题、案例与受影响用法，验证后按[本机同步步骤](../docs/integrations.md#skills账号与升级)更新安装；普通查询不做正式收录。
 
 2026-11-18 的独立联动输入为 HCU-Knowledge `v0.6.3` / `a3a5be5`；本次[内容与流程复核收据](catalog/review-20261118.json)、[原件/在线阅读检查](catalog/reader-check-20261118.json)和[许可复核](catalog/license-review-20261118.json)随仓保留。固定源码阅读、软件检查和 HCU 现场资格分别记录。
+
+容错命令的补充复核、实际遗漏及修复验证见 [0.8.3 命令与流程复核](catalog/fault-command-review-20261118.json)；来源沿用上述已发布大库，普通查询仍按原入口使用。

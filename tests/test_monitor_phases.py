@@ -1,5 +1,6 @@
 """Synthetic observer contract regressions; these are not hardware evidence."""
 import json
+from pathlib import Path
 
 import pytest
 
@@ -54,6 +55,13 @@ def test_compilation_uses_independent_startup_allowance():
     assert kinds([sample(100), sample(401)], 401) == {"startup-timeout"}
     # An unknown liveness state does not reset the original startup clock.
     assert "startup-timeout" in kinds([sample(100), sample(401, phase="unknown")], 401)
+
+
+def test_published_policy_accepts_phase_aware_observations():
+    root = Path(__file__).resolve().parents[1]
+    policy = json.loads((root / "examples/monitor-policy.json").read_text(encoding="utf-8"))
+    assert observation_issues([sample(100), sample(101)], policy, now=101) == []
+    assert observation_issues([sample(100), iteration(110, 1), iteration(111, 2)], policy, now=111) == []
 
 
 @pytest.mark.parametrize("kind", ["memory", "heartbeat", "lifecycle"])

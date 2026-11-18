@@ -25,7 +25,7 @@
 
 ## 观察器换代与缓存保护
 
-扩 DP、完整模型恢复或配置变更造成实际 TaskSpec context 变化时，保留旧日志、parser DB、monitor Store、manifest/exit 和生命周期回执。用旧参数检查并精确停止旧观察器，再运行 `scripts/manage_training_observer.py prepare-context` 创建独立 context+epoch Store；它只准备，不启动训练或宣告监控恢复。不能删除 `watch:TASK_ID` 或只换 parser state-dir 绕过两层检查。相同 context 的普通重启保留 Store，使用新的 attempt/进程身份。
+扩 DP、完整模型恢复或配置变更造成实际 TaskSpec context 变化时，保留旧日志、parser DB、monitor Store、manifest/exit 和生命周期回执。用旧 manifest/policy/workspace/state-dir 检查并精确停止旧观察器；`status/stop` 按保留配置匹配旧作用域，`start` 仍要求当前 task context 一致，不能用新 attempt 参数替代旧记录。再运行 `scripts/manage_training_observer.py prepare-context` 创建独立 context+epoch Store；它只准备，不启动训练或宣告监控恢复。不能删除 `watch:TASK_ID` 或只换 parser state-dir 绕过两层检查。相同 context 的普通重启保留 Store，使用新的 attempt/进程身份。
 
 新 scope 先 once 检查，再验证全部必需观察器的 ready、心跳新鲜度、进程身份和 monitor 状态；启动超时/unknown 保留 attention。训练日志可能由 rank0、最后一个全局 rank 或显式 logger 输出；先核对固定引擎源码和真实日志，配置实际进度来源，其正常推进只证明该日志覆盖的训练进展，不能代替其他节点进程、成员 launcher 退出、首个错误和资源健康。全组结束必须核全部必需 member 的真实退出结果及训练/checkpoint 契约，不以单个日志源 exit0 或一次 heartbeat 作为整体完成。
 

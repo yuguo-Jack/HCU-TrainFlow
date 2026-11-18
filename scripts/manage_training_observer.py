@@ -80,14 +80,16 @@ def _bound(value, name, maximum):
     return value
 
 
-def make_spec(workspace, task, manifest, policy, state_dir=None, exit_receipt=None, interval=30):
+def make_spec(workspace, task, manifest, policy, state_dir=None, exit_receipt=None, interval=30, *,
+              require_current_context=True):
     workspace = Path(workspace).resolve()
     manifest, policy = Path(manifest).resolve(), Path(policy).resolve()
     attempt, thresholds = validate_manifest(read_json(manifest)), read_json(policy)
     check_policy(thresholds)
     if "startup_timeout_seconds" not in thresholds:
         raise FlowError("Observer requires explicit startup_timeout_seconds")
-    if Store(workspace).task(task)["context"] != attempt["context"]:
+    current_context = Store(workspace).task(task)["context"]
+    if require_current_context and current_context != attempt["context"]:
         raise FlowError("Observer attempt and task context differ")
     return {"workspace": str(workspace), "task": task, "manifest": str(manifest), "policy": str(policy),
             "state_dir": str(Path(state_dir or workspace / "training-logs" / task).resolve()),
@@ -184,6 +186,8 @@ def start_observer(spec, *, script=None, startup_timeout=30, freshness_seconds=1
     _bound(freshness_seconds, "freshness_seconds", 86400)
     root = Path(spec["state_dir"])
     with observer_lock(root, name="observer-control.lock"):
+        if Store(spec["workspace"]).task(spec["task"])["context"] != spec["context"]:
+            raise FlowError("Observer attempt and task context differ")
         old = _record(spec)
         if old:
             current = _process(old)
@@ -311,7 +315,11 @@ def main(argv=None):
             parser.error("start/status/stop require --manifest and --policy")
         if args.context_root is not None:
             parser.error("--context-root is only for prepare-context; use its returned workspace explicitly")
-        spec = make_spec(args.workspace, args.task, args.manifest, args.policy, args.state_dir, args.exit_receipt, args.interval_seconds)
+        # Old launches must remain inspectable/stoppable after task-context has
+        # moved on. Their exact retained spec still has to match the record;
+        # only admitting a new observer requires the current task context.
+        spec = make_spec(args.workspace, args.task, args.manifest, args.policy, args.state_dir, args.exit_receipt,
+                         args.interval_seconds, require_current_context=args.action == "start")
         if args.action == "start":
             result = start_observer(spec, startup_timeout=args.timeout_seconds, freshness_seconds=args.freshness_seconds)
         elif args.action == "stop":

@@ -130,6 +130,8 @@ python3 scripts/manage_training_observer.py stop "${observer_args[@]}"
 
 同 state 目录中已存在身份匹配的观察器时，完全相同参数的 `start` 只返回现状；若旧 attempt 仍在运行、新请求的配置不同，拒绝启动。PID 被复用、命名空间不符或身份不明时也拒绝替换。managed 模式固定一份 attempt manifest 和 policy 内容；更换 attempt 或策略应先以原参数停止、保留原件，再用新参数启动。不要原地改写输入文件。独立脚本的 `--continue-after-finish` 用于另行管理的持续观察场景，不与 managed 模式混用。
 
+任务当前 context 已变化时，仍用旧 manifest、policy、workspace 和 state-dir 执行旧观察器的 `status/stop`；它们按原配置的规范 JSON 指纹与保留进程记录匹配，不要求旧 context 等于新任务 context。`start` 仍要求当前任务 context 一致。保留旧输入内容与路径，换成新 attempt/策略的参数不会停止旧进程；旧输入被改写时先恢复对应记录的固定配置并核对身份。
+
 状态字段分别回答不同的问题：
 
 | 字段 | 含义 |

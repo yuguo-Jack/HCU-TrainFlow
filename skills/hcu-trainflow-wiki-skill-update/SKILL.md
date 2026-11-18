@@ -41,6 +41,7 @@ HCU 大知识库已变更或用户要求对齐时，先只读核对其当前提�
 5. 对确实受影响的 overview/topic/case 深读新实现、改原因、触发条件、测试、限制和回退，同仓交叉结论一起修正。必要时扩充关联的第三方优化采用/退役记录。
    已保留且被知识引用的 PR 正文或必要证据变化时，即使没有主干源码变化，也检查 wiki/pr-review 待办；对关联页复核后 wiki-review-pr 留下对应原始 artifact 与页面哈希的回执。
 6. 按 knowledge/maintenance.json 检查官方变化影响；另读 knowledge/catalog/external-knowledge.json（或 `wiki-routes PROJECT`）核对 HCU 工具的维护关联。依托大库与实际部署/最新源码检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤；只修订本仓使用契约，不复制 HCU 仓库知识。任务所用 HCU 模型脚本、环境配置、launcher 或依赖变化时，复核适配/分析优化用法和配方。可复用站点经验按规范放 `knowledge/sites/`，临时排查留任务档案；检查依据、版本及未验证项记入本轮维护记录。
+   容错工具的目录、打包入口、CLI、launcher 或输出变更时，沿真实 console/main/parser、分派脚本和结果生成器核对流程里的命令、环境变量与参数、示例配置及结果路径/状态。检查启动、状态、精确停止、context 换代和重试对账的完整调用链；示例按实际 parser/合成输入验证，不能只补机制说明或用结构检查代替内容复核。现场验证按授权和受影响范围另行进行。
    新增或升级 HCU Primus Turbo、UCCL、UltraEP、MoonEP 等库时，复核 optimize 的 `references/hcu-library-integration.md`、通信专项及 adapt/规模长稳 Skill 调用；分别核对 HCU 主线/专项线、ABI/编译器、provider、同步/异步/精度边界与消费者。知识检索不足时读实际源码，不自动刷新大知识库。
    数学库或 HCU 教程更新时，复核 optimize 的 `references/math-library-tuning.md` 及关联入口：rocBLAS 以持续更新说明及当前推荐工具为准，MIOpen 核对实际版本的日志、布局与 Find/缓存语义。流程保留异常触发、处理方法和资料入口，不复制完整工具手册；hipBLASLt 不默认扩展为自行调优。
    HCU Train Simulator 或训练引擎的模型 adapter、显存/求解公式、Profile、并行约束变化时，复核 `docs/practices/capacity-and-parallel-experiments.md` 和 adapt/optimize/coordinator；检查全参判断、余量与多实例资源隔离，保留旧预测/实测版本，不自动切换活动训练依赖。

@@ -19,9 +19,9 @@
 3. 记录命令所在层、实际路径、版本/提交、所需设备和环境变量、输出格式、退出码含义、是否执行主动负载。不能只按文件名猜测用途。退出成功后仍检查输出能否解析、设备覆盖和必要字段；不同选项组合可能把文本混入 JSON。保留无效原件，按当前 `--help` 拆分只读查询，不从截断/混合输出补造完整结果，也不因此重复主动压测。
 4. 对找不到的能力，先查 HCU-Knowledge、当前工程代码和安装指南；使用与本镜像版本兼容的现有测试。不要因旧脚本中不存在某路径就宣布硬件不支持。
 
-当前 Cluster Manager 的 `hcu-envcheck` 子工程使用统一入口 `hcu-cluster-run`，按 platform/resource、rccl、gemm、ib、custom 场景组织；早期 `hcu_envcheck/cli.py` 已移除。先读[工程入口与输出契约](../knowledge/catalog/external/cluster-manager.md)，再核对现场版本的 `--help`。控制端 Python、远端执行环境与测试二进制分别验证；dry-run 只验证计划，不代表远端资格通过。旧镜像按其实际接口使用，不在任务中无理由强制升级工具。
+当前 Cluster Manager 的 `hcu-envcheck` 子工程使用统一入口 `hcu-cluster-run`，按 scenario 与 operation 两层选择。固定参考版本的 scenario 为 `shared-conda`、`node-local-conda`、`per-node-container`；operation 按对应场景的 dispatch 选择，例如 `platform`、`resource`、`rccl`、`deepep`、`ib-write-bw`，容器场景另有 `container-*` 操作。先读[工程入口与输出契约](../knowledge/catalog/external/cluster-manager.md)，再核对现场版本的 `--help`。控制端 Python、远端执行环境与测试二进制分别验证；dry-run 只验证计划，不代表远端资格通过。旧镜像按其实际接口使用，不在任务中无理由强制升级工具。
 
-新版检查器使用已分配的 hostfile，旧 doctor/verify 和该子工程的 K8s/Slurm 自动选节点入口不能继续照搬；独立 K8s 容错组件仍需另行配置。`cluster-result.json` 的状态、findings、缺项和实际节点覆盖共同决定验收：部分 BLOCKED/INCOMPLETE 路径也返回 0。RCCL 汇总中的各项峰值可能来自不同消息量，先回到逐 size、逐 rank 原始表比较，不把几个独立最大值拼成同一用例成绩。
+新版检查器使用已分配的 hostfile，独立 K8s 容错组件另行配置。当前 Bash controller 默认在 `verify_results/<本次run>/` 下保留 `summary.md`、`failures.tsv`、`group-NNN.log` 和完整 `.state/`；结构化报告为 `.state/report.json`，控制清单为 `.state/control.tsv`，准备事实为 `.state/prepared/group-NNN/facts.json`。按本次运行的控制清单、组成员和阶段身份核对原始证据。controller 按 `.state/report-status.tsv` 返回 `PASS=0`、`WARN=2`、`FAIL=1`，未知状态按 70 处理；不能只读取内部 watch 子进程的退出码。计入工具的有效结论须阶段为 `PASS/WARN` 且清理为 `CONFIRMED`，告警的放行条件再按任务契约判断；未执行、取消、超时或清理未确认不计通过。同时检查计划/预检、实际载荷、清理确认及参与和未参与节点，不把单个阶段状态当整体验收。具体字段和当前固定入口仍由大库维护。RCCL 汇总中的各项峰值可能来自不同消息量，先回到逐 size、逐 rank 原始表比较，不把几个独立最大值拼成同一用例成绩。
 
 同时核对工具状态的实际含义。Cluster Manager 的作业状态和环境检查成功均不证明训练有 step/loss 进展；恢复还须确认原成员终态与新 attempt。已保留源码中仍存在停止重试失败后转入启动的分支，不能因换了目录或版本就认定恢复安全；由现场唯一恢复负责人核对并修复原控制器，详见[训练状态验收](training-state-validation.md)。
 
